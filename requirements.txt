@@ -1,0 +1,19 @@
+# Core Dependencies
+streamlit==1.30.0
+pandas==2.1.4
+numpy==1.26.2
+
+# Visualization
+matplotlib==3.8.2
+seaborn==0.13.0
+plotly==5.18.0
+
+# Machine Learning
+scikit-learn==1.3.2
+
+# Explainable AI
+shap==0.44.0
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
