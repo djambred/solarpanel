@@ -1,4 +1,3 @@
-# app.py — Streamlit app with RandomForest + LSTM + SHAP (fully fixed)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -627,9 +626,9 @@ with tab3:
                                 colors = plt.cm.plasma(np.linspace(0.3, 0.9, len(imp_df)))
                                 
                                 if std_feat_imp is not None:
+                                    # FIX APPLIED HERE: Removed 'elinewidth' and 'capsize'
                                     bars = ax1.barh(imp_df['feature'], imp_df['importance'], 
-                                                   xerr=imp_df['std'], color=colors, alpha=0.8, 
-                                                   elinewidth=2, capsize=5)
+                                                   xerr=imp_df['std'], color=colors, alpha=0.8)
                                 else:
                                     bars = ax1.barh(imp_df['feature'], imp_df['importance'], color=colors)
                                     
@@ -1039,3 +1038,4 @@ st.markdown("""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
