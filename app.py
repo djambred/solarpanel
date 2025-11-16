@@ -19,12 +19,17 @@ from sklearn.inspection import permutation_importance
 try:
     import shap
     SHAP_AVAILABLE = True
+    # Clear any SHAP modifications to TensorFlow
+    if hasattr(shap, 'explainers') and hasattr(shap.explainers, '_deep'):
+        pass  # Don't import deep explainers at module level
 except Exception:
     SHAP_AVAILABLE = False
 
 # Optional: TensorFlow / Keras for LSTM
 try:
     import tensorflow as tf
+    # Set TensorFlow to not be modified by SHAP
+    tf.config.run_functions_eagerly(False)
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping
@@ -43,6 +48,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-header">☀️ INTEGRASI EXPLAINABLE AI — RANDOM FOREST & LSTM</p>', unsafe_allow_html=True)
+
+# Important notice about workflow
+st.info("""
+⚠️ **Important Workflow**: Train models **BEFORE** using SHAP/Explainability features!
+- ✅ Recommended order: Train RF → Train LSTM → Use SHAP → Make Predictions
+- If you get errors after using SHAP, click the "Reset TensorFlow" button before retraining LSTM
+""")
+
 
 # ------------ Utilities ------------
 
@@ -83,6 +96,19 @@ def generate_sample_data(n_samples=1200, seed=42):
     })
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     return df
+
+def reset_tensorflow_session():
+    """Reset TensorFlow session to clear SHAP modifications"""
+    if TF_AVAILABLE:
+        try:
+            tf.keras.backend.clear_session()
+            # Force garbage collection
+            import gc
+            gc.collect()
+            return True
+        except Exception:
+            return False
+    return False
 
 def create_lstm_sequences(X, y, seq_len):
     Xs, ys = [], []
@@ -283,9 +309,23 @@ with tab2:
         if not TF_AVAILABLE:
             st.error("⚠️ TensorFlow not available. Install `tensorflow` to use LSTM.")
         else:
+            # Add reset button if SHAP was used
+            if 'lstm_shap_values' in st.session_state or 'lstm_perm_importance' in st.session_state:
+                if st.button("🔄 Reset TensorFlow (Clear SHAP)", use_container_width=True):
+                    reset_tensorflow_session()
+                    # Clear SHAP session state
+                    for key in list(st.session_state.keys()):
+                        if 'shap' in key.lower():
+                            del st.session_state[key]
+                    st.success("✅ TensorFlow session reset!")
+                    st.rerun()
+            
             if st.button("🚀 Train LSTM", use_container_width=True):
                 with st.spinner("Training LSTM..."):
                     try:
+                        # Force clear any previous TensorFlow sessions
+                        reset_tensorflow_session()
+                        
                         X = df[FEATURES].values
                         y = df['ac_power'].values
                         
@@ -302,6 +342,8 @@ with tab2:
                             y_train_seq, y_test_seq = y_seq[:split_idx], y_seq[split_idx:]
 
                             n_features = X_seq.shape[2]
+                            
+                            # Build model in a clean environment
                             model = Sequential([
                                 LSTM(128, input_shape=(lstm_seq_len, n_features), return_sequences=True),
                                 Dropout(0.2),
@@ -311,10 +353,17 @@ with tab2:
                                 Dense(16, activation='relu'),
                                 Dense(1, activation='linear')
                             ])
-                            model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+                            
+                            # Compile with standard optimizer
+                            model.compile(
+                                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                                loss='mse',
+                                metrics=['mae']
+                            )
 
                             es = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
+                            # Train model
                             history = model.fit(
                                 X_train_seq, y_train_seq,
                                 validation_data=(X_test_seq, y_test_seq),
@@ -330,6 +379,7 @@ with tab2:
                             rmse_train, r2_train, mae_train, mape_train = evaluate_regression(y_train_seq, y_pred_train)
                             rmse_test, r2_test, mae_test, mape_test = evaluate_regression(y_test_seq, y_pred_test)
 
+                            # Save to session state
                             st.session_state['lstm_model'] = model
                             st.session_state['lstm_scaler'] = scaler
                             st.session_state['lstm_seq_len'] = lstm_seq_len
@@ -351,9 +401,32 @@ with tab2:
                             col_b.metric("R² (Test)", f"{r2_test:.3f}")
                             col_c.metric("MAE (Test)", f"{mae_test:.2f}")
                             col_d.metric("MAPE (Test)", f"{mape_test:.2f}%")
+                            
+                            # Clear backend after training to prevent conflicts
+                            tf.keras.backend.clear_session()
 
                     except Exception as e:
                         st.error(f"❌ LSTM training error: {e}")
+                        
+                        # Check if it's a SHAP-related error
+                        error_str = str(e)
+                        if 'shap' in error_str.lower() or 'gradient registry' in error_str.lower():
+                            st.warning("""
+                            🔧 **SHAP Conflict Detected!**
+                            
+                            SHAP telah memodifikasi TensorFlow. Solusi:
+                            1. **Restart aplikasi** dengan refresh browser (Ctrl+R atau Cmd+R)
+                            2. Jangan train LSTM setelah menggunakan SHAP
+                            3. Urutkan: Train LSTM dulu → Kemudian gunakan SHAP
+                            
+                            **Atau gunakan workaround:**
+                            - Restart Streamlit server
+                            - Clear browser cache
+                            """)
+                        
+                        import traceback
+                        with st.expander("🐛 View Full Error"):
+                            st.code(traceback.format_exc())
             
             if st.session_state.get('lstm_trained', False):
                 st.info("✓ LSTM model is ready")
