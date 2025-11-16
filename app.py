@@ -443,20 +443,25 @@ with tab3:
         
         # SHAP for LSTM
         with shap_col2:
-            st.markdown("### 🧠 SHAP for LSTM")
+            st.markdown("### 🧠 Explainability for LSTM")
             
             if not st.session_state.get('lstm_trained', False):
                 st.warning("⚠️ Train LSTM model first")
             elif not TF_AVAILABLE:
                 st.error("⚠️ TensorFlow not available")
             else:
-                shap_method = st.radio("SHAP Method for LSTM", 
-                                      ["KernelExplainer (Slower, More Accurate)", 
-                                       "Gradient-based (Experimental)",
-                                       "Permutation Importance (Fast Alternative)"],
+                st.info("""
+                **Choose an explainability method:**
+                - ⭐ **Permutation Importance**: Fast, reliable, easy to interpret (Recommended)
+                - 🐢 **KernelExplainer**: Slower but provides SHAP values (5-10 minutes)
+                """)
+                
+                shap_method = st.radio("Explainability Method for LSTM", 
+                                      ["Permutation Importance (Fast & Reliable) ⭐", 
+                                       "KernelExplainer (Slower, SHAP-based)"],
                                       key="lstm_shap_method")
                 
-                if st.button("🔬 Compute SHAP (LSTM)", use_container_width=True):
+                if st.button("🔬 Compute Explainability (LSTM)", use_container_width=True):
                     with st.spinner("Computing explainability for LSTM..."):
                         try:
                             model = st.session_state['lstm_model']
@@ -464,13 +469,13 @@ with tab3:
                             y_test_seq = st.session_state['lstm_y_test']
                             
                             if len(X_test_seq) < 10:
-                                st.error("❌ Not enough test samples for SHAP")
+                                st.error("❌ Not enough test samples")
                             else:
                                 if "Permutation" in shap_method:
-                                    # Use Permutation Importance as fast alternative
-                                    st.info("Computing Permutation Importance - fast and model-agnostic...")
+                                    # Use Permutation Importance - most reliable method
+                                    st.info("Computing Permutation Importance - reliable and fast...")
                                     
-                                    sample_size = min(500, len(X_test_seq))
+                                    sample_size = min(300, len(X_test_seq))
                                     X_sample = X_test_seq[:sample_size]
                                     y_sample = y_test_seq[:sample_size]
                                     
@@ -480,107 +485,93 @@ with tab3:
                                     
                                     # Permutation importance for each feature
                                     feature_importance = []
+                                    feature_importance_std = []
                                     
                                     progress_bar = st.progress(0)
-                                    for feat_idx in range(len(FEATURES)):
+                                    status_text = st.empty()
+                                    
+                                    for feat_idx, feat_name in enumerate(FEATURES):
+                                        status_text.text(f"Processing feature: {feat_name} ({feat_idx+1}/{len(FEATURES)})")
                                         importance_scores = []
                                         
-                                        # Repeat permutation multiple times
-                                        for _ in range(5):
+                                        # Repeat permutation multiple times for stability
+                                        for repeat in range(10):
                                             X_permuted = X_sample.copy()
                                             # Permute feature across all timesteps
-                                            X_permuted[:, :, feat_idx] = np.random.permutation(X_permuted[:, :, feat_idx].flatten()).reshape(X_permuted[:, :, feat_idx].shape)
+                                            original_shape = X_permuted[:, :, feat_idx].shape
+                                            X_permuted[:, :, feat_idx] = np.random.permutation(
+                                                X_permuted[:, :, feat_idx].flatten()
+                                            ).reshape(original_shape)
                                             
                                             perm_pred = model.predict(X_permuted, verbose=0).flatten()
                                             perm_score = r2_score(y_sample, perm_pred)
                                             importance_scores.append(baseline_score - perm_score)
                                         
                                         feature_importance.append(np.mean(importance_scores))
+                                        feature_importance_std.append(np.std(importance_scores))
                                         progress_bar.progress((feat_idx + 1) / len(FEATURES))
                                     
                                     progress_bar.empty()
+                                    status_text.empty()
                                     
                                     mean_feat_imp = np.array(feature_importance)
+                                    std_feat_imp = np.array(feature_importance_std)
                                     mean_over_samples = None
+                                    
+                                    st.session_state['lstm_perm_importance'] = mean_feat_imp
+                                    st.session_state['lstm_perm_std'] = std_feat_imp
                                     
                                     st.success("✅ Permutation Importance computed for LSTM")
                                     
                                 elif "KernelExplainer" in shap_method:
                                     # Use KernelExplainer - more stable for LSTM
-                                    st.info("Using KernelExplainer - this may take a few moments...")
+                                    st.info("Using KernelExplainer - this may take several minutes...")
                                     
-                                    # Prepare data
-                                    sample_size = min(100, len(X_test_seq))
-                                    background = X_test_seq[:min(50, len(X_test_seq))]
+                                    # Use smaller samples for KernelExplainer (it's very slow)
+                                    sample_size = min(50, len(X_test_seq))
+                                    background_size = min(20, len(X_test_seq))
+                                    
+                                    background = X_test_seq[:background_size]
                                     sample = X_test_seq[:sample_size]
                                     
                                     # Create a prediction function
                                     def predict_fn(x):
                                         return model.predict(x, verbose=0).flatten()
                                     
-                                    # Use KernelExplainer
-                                    explainer = shap.KernelExplainer(predict_fn, background)
-                                    shap_values = explainer.shap_values(sample, nsamples=100)
+                                    # Use KernelExplainer with limited samples
+                                    with st.spinner(f"Initializing explainer with {background_size} background samples..."):
+                                        explainer = shap.KernelExplainer(predict_fn, background)
+                                    
+                                    with st.spinner(f"Computing SHAP values for {sample_size} samples (nsamples=50)..."):
+                                        shap_values = explainer.shap_values(sample, nsamples=50)
                                     
                                     shap_array = np.array(shap_values)
                                     
-                                else:
-                                    # Try GradientExplainer as alternative
-                                    st.info("Using GradientExplainer...")
+                                    st.session_state['lstm_shap_values'] = shap_array
                                     
-                                    background = X_test_seq[:min(100, len(X_test_seq))]
-                                    sample = X_test_seq[:min(200, len(X_test_seq))]
+                                    st.success("✅ SHAP computed for LSTM")
                                     
-                                    try:
-                                        explainer = shap.GradientExplainer(model, background)
-                                        shap_values = explainer.shap_values(sample)
-                                        
-                                        if isinstance(shap_values, list):
-                                            shap_array = np.array(shap_values[0])
+                                    # Handle different shapes
+                                    abs_shap = np.abs(shap_array)
+                                    
+                                    if len(abs_shap.shape) == 3:  # (samples, timesteps, features)
+                                        mean_over_samples = np.mean(abs_shap, axis=0)  # (timesteps, features)
+                                        mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (features,)
+                                    elif len(abs_shap.shape) == 2:  # (samples, features)
+                                        n_features = len(FEATURES)
+                                        if abs_shap.shape[1] % n_features == 0:
+                                            seq_len = abs_shap.shape[1] // n_features
+                                            reshaped = abs_shap.reshape(-1, seq_len, n_features)
+                                            mean_over_samples = np.mean(reshaped, axis=0)
+                                            mean_feat_imp = np.mean(mean_over_samples, axis=0)
                                         else:
-                                            shap_array = np.array(shap_values)
-                                    except Exception as grad_error:
-                                        st.warning(f"GradientExplainer failed: {grad_error}")
-                                        st.info("Falling back to KernelExplainer...")
-                                        
-                                        # Fallback to KernelExplainer
-                                        sample_size = min(50, len(X_test_seq))
-                                        background = X_test_seq[:min(30, len(X_test_seq))]
-                                        sample = X_test_seq[:sample_size]
-                                        
-                                        def predict_fn(x):
-                                            return model.predict(x, verbose=0).flatten()
-                                        
-                                        explainer = shap.KernelExplainer(predict_fn, background)
-                                        shap_values = explainer.shap_values(sample, nsamples=50)
-                                        shap_array = np.array(shap_values)
-                                
-                                st.session_state['lstm_shap_values'] = shap_array
-                                
-                                st.success("✅ SHAP computed for LSTM")
-                                
-                                # Feature importance averaged over timesteps and samples
-                                abs_shap = np.abs(shap_array)
-                                
-                                # Handle different shapes
-                                if len(abs_shap.shape) == 3:  # (samples, timesteps, features)
-                                    mean_over_samples = np.mean(abs_shap, axis=0)  # (timesteps, features)
-                                    mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (features,)
-                                elif len(abs_shap.shape) == 2:  # (samples, features) - flattened
-                                    n_features = len(FEATURES)
-                                    # Reshape if possible
-                                    if abs_shap.shape[1] % n_features == 0:
-                                        seq_len = abs_shap.shape[1] // n_features
-                                        reshaped = abs_shap.reshape(-1, seq_len, n_features)
-                                        mean_over_samples = np.mean(reshaped, axis=0)
-                                        mean_feat_imp = np.mean(mean_over_samples, axis=0)
+                                            mean_feat_imp = np.mean(abs_shap[:, :n_features], axis=0)
+                                            mean_over_samples = None
                                     else:
-                                        # Just average over samples for each feature
-                                        mean_feat_imp = np.mean(abs_shap[:, :n_features], axis=0)
+                                        mean_feat_imp = np.mean(abs_shap, axis=0)
                                         mean_over_samples = None
-                                else:
-                                    mean_feat_imp = np.mean(abs_shap, axis=0)
-                                    mean_over_samples = None
+                                    
+                                    std_feat_imp = None
                                 
                                 # Feature importance plot
                                 st.markdown("#### Feature Importance (Avg over timesteps)")
@@ -591,15 +582,29 @@ with tab3:
                                 else:
                                     normalized_imp = mean_feat_imp
                                 
-                                imp_df = pd.DataFrame({
+                                # Create dataframe with standard deviation if available
+                                imp_dict = {
                                     'feature': FEATURES[:len(mean_feat_imp)], 
                                     'importance': mean_feat_imp,
                                     'normalized': normalized_imp
-                                }).sort_values('importance', ascending=True)
+                                }
+                                
+                                if std_feat_imp is not None:
+                                    imp_dict['std'] = std_feat_imp
+                                
+                                imp_df = pd.DataFrame(imp_dict).sort_values('importance', ascending=True)
                                 
                                 fig1, ax1 = plt.subplots(figsize=(8, 6))
                                 colors = plt.cm.plasma(np.linspace(0.3, 0.9, len(imp_df)))
-                                bars = ax1.barh(imp_df['feature'], imp_df['importance'], color=colors)
+                                
+                                if std_feat_imp is not None and "Permutation" in shap_method:
+                                    # Add error bars for permutation importance
+                                    bars = ax1.barh(imp_df['feature'], imp_df['importance'], 
+                                                   xerr=imp_df['std'] if 'std' in imp_df.columns else None,
+                                                   color=colors, alpha=0.8, elinewidth=2, capsize=5)
+                                else:
+                                    bars = ax1.barh(imp_df['feature'], imp_df['importance'], color=colors)
+                                    
                                 ax1.set_xlabel('Feature Importance Score', fontsize=12)
                                 
                                 if "Permutation" in shap_method:
@@ -633,19 +638,30 @@ with tab3:
                                 
                                 # Summary statistics
                                 st.markdown("#### 📊 Feature Importance Statistics")
-                                shap_stats = pd.DataFrame({
+                                
+                                stats_dict = {
                                     'Feature': FEATURES[:len(mean_feat_imp)],
                                     'Importance': mean_feat_imp,
-                                    'Abs Importance': np.abs(mean_feat_imp),
-                                    'Rank': range(1, len(mean_feat_imp) + 1)
-                                }).sort_values('Abs Importance', ascending=False)
+                                    'Abs Importance': np.abs(mean_feat_imp)
+                                }
+                                
+                                if std_feat_imp is not None:
+                                    stats_dict['Std Dev'] = std_feat_imp
+                                
+                                shap_stats = pd.DataFrame(stats_dict).sort_values('Abs Importance', ascending=False)
                                 shap_stats['Rank'] = range(1, len(shap_stats) + 1)
                                 
-                                st.dataframe(shap_stats.style.format({
+                                # Format based on available columns
+                                format_dict = {
                                     'Importance': '{:.6f}',
                                     'Abs Importance': '{:.6f}'
-                                }).background_gradient(subset=['Abs Importance'], cmap='YlOrRd'), 
-                                use_container_width=True)
+                                }
+                                if 'Std Dev' in shap_stats.columns:
+                                    format_dict['Std Dev'] = '{:.6f}'
+                                
+                                st.dataframe(shap_stats.style.format(format_dict)
+                                           .background_gradient(subset=['Abs Importance'], cmap='YlOrRd'), 
+                                           use_container_width=True)
                                 
                                 # Method explanation
                                 if "Permutation" in shap_method:
@@ -661,13 +677,15 @@ with tab3:
                                     """)
                                 
                         except Exception as e:
-                            st.error(f"❌ SHAP LSTM error: {e}")
+                            st.error(f"❌ Explainability error: {e}")
+                            import traceback
+                            st.code(traceback.format_exc())
                             st.info("""
                             💡 **Troubleshooting Tips:**
-                            - Try using KernelExplainer method (slower but more stable)
-                            - Reduce the number of samples
-                            - Ensure TensorFlow version is compatible with SHAP
-                            - Alternative: Use feature permutation importance instead
+                            - ✅ **Recommended**: Use "Permutation Importance" - fastest and most reliable
+                            - KernelExplainer is very slow but works if you have time
+                            - Ensure model is trained properly
+                            - Check that test data has enough samples (>50)
                             """)
 
 # ---------- Tab 4: Predictions ----------
