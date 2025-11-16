@@ -1,9 +1,9 @@
-# app.py — Streamlit app with RandomForest + LSTM + SHAP (RF & LSTM)
+# app.py — Streamlit app with RandomForest + LSTM + SHAP (full)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # headless backend
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
@@ -43,9 +43,8 @@ st.markdown("""
 
 st.markdown('<p class="main-header">☀️ INTEGRASI EXPLAINABLE AI — RANDOM FOREST & LSTM</p>', unsafe_allow_html=True)
 
-# -------------------------
-# Utilities
-# -------------------------
+# ------------ Utilities ------------
+
 @st.cache_data
 def generate_sample_data(n_samples=1200, seed=42):
     np.random.seed(seed)
@@ -67,6 +66,7 @@ def generate_sample_data(n_samples=1200, seed=42):
     dc_power = (irradiance * 1.6 * efficiency / 100) * (1 - cloud / 200)
     dc_power = np.maximum(0, dc_power + np.random.normal(0, 5, n_samples))
     ac_power = np.maximum(0, dc_power * 0.96 + np.random.normal(0, 3, n_samples))
+
     df = pd.DataFrame({
         "timestamp": dates,
         "irradiance": irradiance,
@@ -80,6 +80,8 @@ def generate_sample_data(n_samples=1200, seed=42):
         "dc_power": dc_power,
         "ac_power": ac_power
     })
+    # ensure proper dtype for timestamp
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
     return df
 
 def create_lstm_sequences(X, y, seq_len):
@@ -95,25 +97,31 @@ def evaluate_regression(y_true, y_pred):
     mae = mean_absolute_error(y_true, y_pred)
     return rmse, r2, mae
 
-# -------------------------
-# Sidebar: configs
-# -------------------------
+# ------------ Sidebar config & data load ------------
+
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2917/2917995.png", width=80)
     st.title("⚙️ Konfigurasi")
 
     source = st.radio("Sumber Data", ["Sample", "Upload CSV"])
     if source == "Upload CSV":
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
-        if uploaded is not None:
+        uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+        if uploaded_file is not None:
             try:
-                df = pd.read_csv(uploaded)
+                # try parsing timestamps if present
+                tmp = pd.read_csv(uploaded_file, nrows=0)
+                parse_dates = ['timestamp'] if 'timestamp' in tmp.columns else None
+                df = pd.read_csv(uploaded_file, parse_dates=parse_dates)
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
                 st.success("✅ CSV loaded")
             except Exception as e:
-                st.error(f"Failed loading CSV: {e}")
+                st.error(f"Error reading CSV: {e}")
                 df = generate_sample_data()
+                st.info("Using sample data instead")
         else:
             df = generate_sample_data()
+            st.info("Using sample data")
     else:
         n_samples = st.slider("Jumlah Sampel", 600, 5000, 1200, 100)
         df = generate_sample_data(n_samples)
@@ -135,33 +143,51 @@ with st.sidebar:
     st.subheader("Train/Test")
     test_size = st.slider("Test size (%)", 10, 40, 20, 5) / 100
 
-# -------------------------
-# Tabs UI
-# -------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Data", "🤖 Train", "🔍 XAI", "📈 Predict"])
+# normalize timestamp once (defensive)
+if 'timestamp' in df.columns:
+    try:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    except Exception:
+        # fallback to string for display only
+        df = df.copy()
+        df['timestamp'] = df['timestamp'].astype(str)
 
-# feature set
+# ------------ Tabs UI ------------
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Data & EDA", "🤖 Train", "🔍 XAI", "📈 Predict"])
+
 FEATURES = ['irradiance','ambient_temperature','module_temperature','humidity','wind_speed','atmospheric_pressure','cloud_cover','panel_efficiency']
 
-# -------------------------
-# Tab 1: Data
-# -------------------------
+# ---------- Tab 1: Data & EDA ----------
 with tab1:
-    st.subheader("Preview Data")
-    st.dataframe(df.head(), use_container_width=True)
-    st.subheader("Descriptive Stats")
-    st.dataframe(df.describe(), use_container_width=True)
+    st.subheader("Data Preview")
+    try:
+        st.dataframe(df.head(10), width='stretch')
+    except Exception:
+        # final fallback: show strings only
+        st.write(df.head(10).astype(str))
 
-# -------------------------
-# Tab 2: Train
-# -------------------------
+    st.subheader("Descriptive Statistics")
+    try:
+        st.dataframe(df.describe(), width='stretch')
+    except Exception:
+        st.write(df.describe().astype(str))
+
+    st.subheader("AC Power Distribution")
+    fig, ax = plt.subplots(figsize=(8,4))
+    df['ac_power'].hist(bins=50, ax=ax)
+    ax.set_xlabel("AC Power (W)")
+    st.pyplot(fig)
+    plt.close(fig)
+
+# ---------- Tab 2: Train ----------
 with tab2:
     st.subheader("Train Model")
 
     if model_choice == "Random Forest":
         st.write("Model: Random Forest")
-        if st.button("🚀 Train RF"):
-            with st.spinner("Training RF..."):
+        if st.button("🚀 Train Random Forest"):
+            with st.spinner("Training Random Forest..."):
                 try:
                     X = df[FEATURES].copy()
                     y = df['ac_power'].copy()
@@ -184,7 +210,7 @@ with tab2:
                     st.session_state['y_test'] = y_test
                     st.session_state['features'] = FEATURES
 
-                    st.success("✅ RF trained")
+                    st.success("✅ Random Forest trained")
                     st.metric("RMSE", f"{rmse:.2f}")
                     st.metric("R2", f"{r2:.3f}")
                     st.metric("MAE", f"{mae:.2f}")
@@ -192,13 +218,13 @@ with tab2:
                 except Exception as e:
                     st.error(f"RF training error: {e}")
 
-    else:
+    else:  # LSTM
         st.write("Model: LSTM")
         if not TF_AVAILABLE:
-            st.error("TensorFlow not available. To use LSTM install `tensorflow` or `tensorflow-cpu`.")
+            st.error("TensorFlow not available. Install `tensorflow` or `tensorflow-cpu` to use LSTM.")
         else:
             if st.button("🚀 Train LSTM"):
-                with st.spinner("Preparing LSTM data & training..."):
+                with st.spinner("Preparing data & training LSTM..."):
                     try:
                         X = df[FEATURES].values
                         y = df['ac_power'].values
@@ -251,20 +277,18 @@ with tab2:
                     except Exception as e:
                         st.error(f"LSTM training error: {e}")
 
-# -------------------------
-# Tab 3: XAI (SHAP)
-# -------------------------
+# ---------- Tab 3: XAI (SHAP) ----------
 with tab3:
     st.subheader("Explainable AI (SHAP)")
 
     if 'model' not in st.session_state:
-        st.warning("Train a model first in the Train tab.")
+        st.warning("Train a model first (Train tab).")
     else:
         mtype = st.session_state.get('model_type', 'rf')
         st.write(f"Explaining model: **{mtype.upper()}**")
 
         if not SHAP_AVAILABLE:
-            st.error("SHAP not installed in environment. Install `shap` to use XAI features.")
+            st.error("SHAP not installed in environment. Install `shap` to enable XAI.")
         else:
             if mtype == 'rf':
                 if st.button("🔬 SHAP for RF"):
@@ -276,13 +300,13 @@ with tab3:
                             explainer = shap.TreeExplainer(rf)
                             shap_values = explainer.shap_values(X_test_s)
 
-                            # Summary plot (beeswarm)
+                            # Summary (beeswarm)
                             fig = plt.figure(figsize=(10,6))
                             shap.summary_plot(shap_values, X_test_s, feature_names=feat_names, show=False)
                             st.pyplot(fig)
                             plt.close(fig)
 
-                            # Feature importance bar (mean(|shap|))
+                            # Feature importance bar
                             avg_imp = np.mean(np.abs(shap_values), axis=0)
                             imp_df = pd.DataFrame({'feature': feat_names, 'importance': avg_imp}).sort_values('importance', ascending=True)
                             fig2, ax2 = plt.subplots(figsize=(8,6))
@@ -296,61 +320,56 @@ with tab3:
 
             else:  # LSTM
                 if not TF_AVAILABLE:
-                    st.error("TensorFlow not available — cannot compute SHAP for LSTM.")
+                    st.error("TensorFlow not available — cannot compute SHAP for LSTM here.")
                 else:
                     if st.button("🔬 SHAP for LSTM"):
                         with st.spinner("Computing SHAP values for LSTM (DeepExplainer)..."):
                             try:
                                 model = st.session_state['model']
-                                X_test_seq = st.session_state['X_test_seq']
-                                feat_names = st.session_state.get('features', [f"f{i}" for i in range(X_test_seq.shape[2])])
+                                X_test_seq = st.session_state.get('X_test_seq', None)
+                                feat_names = st.session_state.get('features', [f"f{i}" for i in range(len(FEATURES))])
                                 if X_test_seq is None or len(X_test_seq) == 0:
                                     st.error("No LSTM test sequences found. Retrain with more data or shorter seq length.")
                                 else:
-                                    # choose small background (use first N train samples or random)
                                     background = X_test_seq[:min(50, len(X_test_seq))]
                                     try:
                                         explainer = shap.DeepExplainer(model, background)
                                         sample = X_test_seq[:min(200, len(X_test_seq))]
                                         shap_values = explainer.shap_values(sample)
-                                        # shap_values might be list or array
                                         if isinstance(shap_values, list):
                                             arr = np.array(shap_values[0])
                                         else:
                                             arr = np.array(shap_values)
                                         # arr shape: (n_samples, seq_len, n_features)
-                                        # compute mean absolute importance across samples and timesteps
                                         abs_arr = np.abs(arr)
                                         mean_over_samples = np.mean(abs_arr, axis=0)  # (seq_len, n_features)
                                         mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (n_features,)
 
-                                        # Bar plot: importance per feature (averaged over timesteps)
+                                        # Bar plot: importance per feature (average over timesteps)
                                         imp_df = pd.DataFrame({'feature': feat_names, 'importance': mean_feat_imp}).sort_values('importance', ascending=True)
                                         fig1, ax1 = plt.subplots(figsize=(8,6))
                                         ax1.barh(imp_df['feature'], imp_df['importance'])
-                                        ax1.set_title("Approx. SHAP importance (LSTM, averaged over timesteps)")
+                                        ax1.set_title("Approx. SHAP importance (LSTM averaged over timesteps)")
                                         st.pyplot(fig1)
                                         plt.close(fig1)
 
-                                        # Heatmap: importance per timestep x feature (average over samples)
+                                        # Heatmap: timestep x feature
                                         fig2, ax2 = plt.subplots(figsize=(10,6))
-                                        sns.heatmap(mean_over_samples.T, cmap='viridis', xticklabels=False, yticklabels=feat_names, ax=ax2)
+                                        sns.heatmap(mean_over_samples.T, cmap='viridis', yticklabels=feat_names, xticklabels=False, ax=ax2)
                                         ax2.set_xlabel("Timestep (sequence index)")
                                         ax2.set_ylabel("Feature")
-                                        ax2.set_title("SHAP abs mean (feature × timestep) — LSTM")
+                                        ax2.set_title("SHAP abs mean (feature × timestep)")
                                         st.pyplot(fig2)
                                         plt.close(fig2)
 
                                     except Exception as e:
-                                        st.error(f"DeepExplainer failed: {e}. DeepExplainer requires TF model and compatible SHAP version. You may try KernelExplainer (very slow) as fallback.")
+                                        st.error(f"DeepExplainer failed: {e}. DeepExplainer needs TF model and compatible SHAP version.")
                             except Exception as e:
                                 st.error(f"SHAP LSTM error: {e}")
 
-# -------------------------
-# Tab 4: Predict
-# -------------------------
+# ---------- Tab 4: Predict ----------
 with tab4:
-    st.subheader("Manual Prediction / Forecasting")
+    st.subheader("Manual Prediction / Forecast")
 
     if 'model' not in st.session_state:
         st.warning("Train a model first in the Train tab.")
@@ -391,16 +410,15 @@ with tab4:
                         seq_len = st.session_state.get('lstm_seq_len', lstm_seq_len)
                         X_in = np.array([[irr, amb, modt, hum, wind, pres, cloud, eff]])
                         Xs = scaler.transform(X_in)  # (1, n_features)
-                        # Build a sequence input: use last available test sequence if present, otherwise repeat current row
+
+                        # build sequence: prefer last test sequence, else repeat current
                         if 'X_test_seq' in st.session_state and len(st.session_state['X_test_seq'])>0:
-                            last_seq = st.session_state['X_test_seq'][-1]  # shape (seq_len, n_features)
-                            # replace last row in the sequence with current input (shift)
-                            seq = np.copy(last_seq)
-                            seq = np.vstack([seq[1:], Xs[0]])
-                            seq = seq.reshape(1, seq.shape[0], seq.shape[1])
+                            last_seq = st.session_state['X_test_seq'][-1].copy()
+                            last_seq = np.vstack([last_seq[1:], Xs[0]]) if last_seq.shape[0] >= seq_len else np.tile(Xs[0], (seq_len,1))
+                            seq = last_seq.reshape(1, last_seq.shape[0], last_seq.shape[1])
                         else:
-                            # fallback: repeat current input
                             seq = np.tile(Xs.reshape(1,1,-1), (1, seq_len, 1))
+
                         pred = model.predict(seq).flatten()[0]
                         st.success(f"Predicted AC Power (LSTM): {pred:.2f} W")
                     except Exception as e:
