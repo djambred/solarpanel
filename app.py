@@ -1,4 +1,4 @@
-# app.py — Solar Energy XAI (RF + LSTM) with lazy SHAP import and robust fallbacks
+# app.py — Streamlit app with RandomForest + LSTM + SHAP (improved)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,13 +9,20 @@ import seaborn as sns
 import warnings
 warnings.filterwarnings("ignore")
 
-# sklearn
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.inspection import permutation_importance
 
-# TensorFlow (optional for LSTM)
+# Optional: SHAP
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
+
+# Optional: TensorFlow / Keras for LSTM
 try:
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
@@ -25,51 +32,25 @@ try:
 except Exception:
     TF_AVAILABLE = False
 
-# NOTE: do NOT import shap at module load time. We'll import lazily when user requests SHAP.
-SHAP_AVAILABLE = None  # None = unknown; True/False after dynamic import attempt
+st.set_page_config(page_title="Solar Energy XAI (RF + LSTM)", page_icon="☀️", layout="wide")
 
-# --------------------
-# Helpers
-# --------------------
-def make_arrow_safe(df_in):
-    """Make DataFrame safe for pyarrow/Streamlit: convert datelike -> datetime, numeric-like -> numeric, else -> str"""
-    if df_in is None:
-        return df_in
-    df = df_in.copy()
-    for col in df.columns:
-        try:
-            series = df[col]
-            if pd.api.types.is_datetime64_any_dtype(series):
-                df[col] = pd.to_datetime(series, errors="coerce")
-                continue
+st.markdown("""
+    <style>
+    .main-header { font-size: 1.8rem; color: #FF6B35; text-align: center; margin-bottom: 1rem; }
+    .sub-header { font-size: 1.1rem; color: #004E89; margin-top: 1rem; }
+    .metric-card { background-color: #f0f2f6; padding: 1rem; border-radius: 0.5rem; margin: 0.5rem 0; }
+    </style>
+""", unsafe_allow_html=True)
 
-            if series.dtype == object:
-                sample = series.dropna().astype(str).head(20)
-                if not sample.empty and all(any(ch in s for ch in [":", "-", "T"]) for s in sample):
-                    parsed = pd.to_datetime(series, errors="coerce")
-                    if parsed.notna().sum() / max(1, len(parsed)) > 0.5:
-                        df[col] = parsed
-                        continue
+st.markdown('<p class="main-header">☀️ INTEGRASI EXPLAINABLE AI — RANDOM FOREST & LSTM</p>', unsafe_allow_html=True)
 
-            if pd.api.types.is_numeric_dtype(series):
-                df[col] = pd.to_numeric(series, errors="coerce")
-                continue
-
-            coerced_num = pd.to_numeric(series, errors="coerce")
-            if coerced_num.notna().sum() > len(series) * 0.5:
-                df[col] = coerced_num
-                continue
-
-            df[col] = series.astype(str)
-        except Exception:
-            df[col] = df[col].astype(str)
-    return df
+# ------------ Utilities ------------
 
 @st.cache_data
 def generate_sample_data(n_samples=1200, seed=42):
     np.random.seed(seed)
     dates = pd.date_range(start="2023-01-01", periods=n_samples, freq="15min")
-    hours = dates.hour + dates.minute / 60
+    hours = dates.hour + dates.minute/60
     days = np.arange(n_samples) / 96
     daily_pattern = np.sin((hours - 6) * np.pi / 12)
     seasonal_variation = 1 + 0.3 * np.sin(days * 2 * np.pi / 365)
@@ -117,22 +98,8 @@ def evaluate_regression(y_true, y_pred):
     mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-10))) * 100
     return rmse, r2, mae, mape
 
-# --------------------
-# Page config & UI
-# --------------------
-st.set_page_config(page_title="Solar Energy XAI (RF + LSTM)", page_icon="☀️", layout="wide")
-st.markdown("""
-    <style>
-    .main-header { font-size: 1.8rem; color: #FF6B35; text-align: center; margin-bottom: 1rem; }
-    .sub-header { font-size: 1.1rem; color: #004E89; margin-top: 1rem; }
-    .metric-card { background-color: #f0f2f6; padding: 1rem; border-radius: 0.5rem; margin: 0.5rem 0; }
-    </style>
-""", unsafe_allow_html=True)
-st.markdown('<p class="main-header">☀️ INTEGRASI EXPLAINABLE AI — RANDOM FOREST & LSTM</p>', unsafe_allow_html=True)
+# ------------ Sidebar config & data load ------------
 
-# --------------------
-# Sidebar: data + hyperparams
-# --------------------
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2917/2917995.png", width=80)
     st.title("⚙️ Konfigurasi")
@@ -142,9 +109,7 @@ with st.sidebar:
         uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
         if uploaded_file is not None:
             try:
-                tmp = pd.read_csv(uploaded_file, nrows=0)
-                parse_dates = ['timestamp'] if 'timestamp' in tmp.columns else None
-                df = pd.read_csv(uploaded_file, parse_dates=parse_dates)
+                df = pd.read_csv(uploaded_file)
                 if 'timestamp' in df.columns:
                     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
                 st.success("✅ CSV loaded")
@@ -161,7 +126,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Hyperparameters")
-
+    
     st.markdown("**Random Forest**")
     rf_n_estimators = st.slider("n_estimators", 50, 500, 100, 50)
     rf_max_depth = st.slider("max_depth", 5, 50, 10, 5)
@@ -175,7 +140,7 @@ with st.sidebar:
     st.subheader("Train/Test Split")
     test_size = st.slider("Test size (%)", 10, 40, 20, 5) / 100
 
-# defensive timestamp normalization
+# Normalize timestamp
 if 'timestamp' in df.columns:
     try:
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -184,94 +149,99 @@ if 'timestamp' in df.columns:
 
 FEATURES = ['irradiance','ambient_temperature','module_temperature','humidity','wind_speed','atmospheric_pressure','cloud_cover','panel_efficiency']
 
-# session state flags
+# Initialize session state
 if 'rf_trained' not in st.session_state:
     st.session_state['rf_trained'] = False
 if 'lstm_trained' not in st.session_state:
     st.session_state['lstm_trained'] = False
 
-# --------------------
-# Tabs
-# --------------------
+# ------------ Tabs UI ------------
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Data & EDA", "🤖 Train Models", "🔍 XAI (SHAP)", "📈 Predictions", "⚖️ Model Comparison"])
 
-# ---------- Tab 1 ----------
+# ---------- Tab 1: Data & EDA ----------
 with tab1:
     st.subheader("📋 Data Preview")
-    try:
-        safe = make_arrow_safe(df.head(20))
-        st.dataframe(safe, width='stretch')
-    except Exception:
-        st.write(df.head(20).astype(str))
+    st.dataframe(df.head(20), use_container_width=True)
 
     col1, col2 = st.columns(2)
+    
     with col1:
         st.subheader("📊 Descriptive Statistics")
-        try:
-            stats = make_arrow_safe(df.describe())
-            st.dataframe(stats, width='stretch')
-        except Exception:
-            st.write(df.describe().astype(str))
+        st.dataframe(df.describe(), use_container_width=True)
+    
     with col2:
         st.subheader("🔢 Data Info")
         st.write(f"**Total Rows:** {len(df)}")
         st.write(f"**Features:** {len(FEATURES)}")
         st.write(f"**Target:** ac_power")
-        st.write(f"**Missing Values (total):** {df.isnull().sum().sum()}")
+        st.write(f"**Missing Values:** {df.isnull().sum().sum()}")
 
-    st.subheader("📈 Visualizations")
-    v1, v2 = st.columns(2)
-    with v1:
+    st.subheader("📈 Data Visualizations")
+    
+    viz_col1, viz_col2 = st.columns(2)
+    
+    with viz_col1:
         fig1, ax1 = plt.subplots(figsize=(8,5))
-        df['ac_power'].hist(bins=50, ax=ax1)
-        ax1.set_xlabel("AC Power (W)")
-        ax1.set_title("AC Power Distribution")
+        df['ac_power'].hist(bins=50, ax=ax1, color='skyblue', edgecolor='black')
+        ax1.set_xlabel("AC Power (W)", fontsize=12)
+        ax1.set_ylabel("Frequency", fontsize=12)
+        ax1.set_title("AC Power Distribution", fontsize=14, fontweight='bold')
+        ax1.grid(alpha=0.3)
         st.pyplot(fig1)
         plt.close(fig1)
-    with v2:
+    
+    with viz_col2:
         fig2, ax2 = plt.subplots(figsize=(8,5))
-        df['irradiance'].plot(ax=ax2, linewidth=0.8)
-        ax2.set_xlabel("Index")
-        ax2.set_title("Irradiance Over Time (index)")
+        df['irradiance'].plot(ax=ax2, color='orange', linewidth=0.8)
+        ax2.set_xlabel("Time Index", fontsize=12)
+        ax2.set_ylabel("Irradiance (W/m²)", fontsize=12)
+        ax2.set_title("Irradiance Over Time", fontsize=14, fontweight='bold')
+        ax2.grid(alpha=0.3)
         st.pyplot(fig2)
         plt.close(fig2)
 
     st.subheader("🔥 Correlation Heatmap")
-    try:
-        num_cols = df.select_dtypes(include=[np.number]).columns
-        corr = df[num_cols].corr()
-        fig3, ax3 = plt.subplots(figsize=(10,8))
-        sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, ax=ax3)
-        ax3.set_title("Feature Correlation")
-        st.pyplot(fig3)
-        plt.close(fig3)
-    except Exception:
-        st.write("Correlation plot failed (maybe not enough numeric columns).")
+    fig3, ax3 = plt.subplots(figsize=(12,8))
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    corr = df[numeric_cols].corr()
+    sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm', ax=ax3, center=0, 
+                linewidths=1, cbar_kws={"shrink": 0.8})
+    ax3.set_title("Feature Correlation Matrix", fontsize=14, fontweight='bold')
+    st.pyplot(fig3)
+    plt.close(fig3)
 
-# ---------- Tab 2: Train ----------
+# ---------- Tab 2: Train Models ----------
 with tab2:
-    st.subheader("🤖 Train Models")
-    left, right = st.columns(2)
-
-    # Random Forest
-    with left:
-        st.markdown("### 🌲 Random Forest")
-        st.write(f"Estimators: {rf_n_estimators}, Max depth: {rf_max_depth}, Test size: {test_size*100:.0f}%")
+    st.subheader("🤖 Train Machine Learning Models")
+    
+    train_col1, train_col2 = st.columns(2)
+    
+    # Random Forest Training
+    with train_col1:
+        st.markdown("### 🌲 Random Forest Regressor")
+        st.write(f"**Estimators:** {rf_n_estimators}")
+        st.write(f"**Max Depth:** {rf_max_depth}")
+        st.write(f"**Test Size:** {test_size*100:.0f}%")
+        
         if st.button("🚀 Train Random Forest", use_container_width=True):
             with st.spinner("Training Random Forest..."):
                 try:
                     X = df[FEATURES].copy()
                     y = df['ac_power'].copy()
                     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+                    
                     scaler = StandardScaler()
                     X_train_s = scaler.fit_transform(X_train)
                     X_test_s = scaler.transform(X_test)
 
-                    rf = RandomForestRegressor(n_estimators=rf_n_estimators, max_depth=rf_max_depth, random_state=42, n_jobs=1)
+                    rf = RandomForestRegressor(n_estimators=rf_n_estimators, max_depth=rf_max_depth, 
+                                              random_state=42, n_jobs=-1)
                     rf.fit(X_train_s, y_train)
 
                     y_pred_train = rf.predict(X_train_s)
                     y_pred_test = rf.predict(X_test_s)
+                    
                     rmse_train, r2_train, mae_train, mape_train = evaluate_regression(y_train, y_pred_train)
                     rmse_test, r2_test, mae_test, mape_test = evaluate_regression(y_test, y_pred_test)
 
@@ -289,36 +259,43 @@ with tab2:
                     }
                     st.session_state['rf_trained'] = True
 
-                    st.success("✅ Random Forest trained")
-                    c1,c2,c3,c4 = st.columns(4)
-                    c1.metric("RMSE (test)", f"{rmse_test:.2f}")
-                    c2.metric("R² (test)", f"{r2_test:.3f}")
-                    c3.metric("MAE (test)", f"{mae_test:.2f}")
-                    c4.metric("MAPE (test)", f"{mape_test:.2f}%")
+                    st.success("✅ Random Forest trained successfully!")
+                    
+                    col_a, col_b, col_c, col_d = st.columns(4)
+                    col_a.metric("RMSE (Test)", f"{rmse_test:.2f}")
+                    col_b.metric("R² (Test)", f"{r2_test:.3f}")
+                    col_c.metric("MAE (Test)", f"{mae_test:.2f}")
+                    col_d.metric("MAPE (Test)", f"{mape_test:.2f}%")
+
                 except Exception as e:
-                    st.error(f"RF training failed: {e}")
-
+                    st.error(f"❌ RF training error: {e}")
+        
         if st.session_state.get('rf_trained', False):
-            st.info("Random Forest is trained")
-
-    # LSTM
-    with right:
-        st.markdown("### 🧠 LSTM")
-        st.write(f"Seq len: {lstm_seq_len}, Epochs: {lstm_epochs}, Batch: {lstm_batch}")
+            st.info("✓ Random Forest model is ready")
+    
+    # LSTM Training
+    with train_col2:
+        st.markdown("### 🧠 LSTM Neural Network")
+        st.write(f"**Sequence Length:** {lstm_seq_len}")
+        st.write(f"**Epochs:** {lstm_epochs}")
+        st.write(f"**Batch Size:** {lstm_batch}")
+        
         if not TF_AVAILABLE:
-            st.error("TensorFlow not available. Install tensorflow to enable LSTM.")
+            st.error("⚠️ TensorFlow not available. Install `tensorflow` to use LSTM.")
         else:
             if st.button("🚀 Train LSTM", use_container_width=True):
                 with st.spinner("Training LSTM..."):
                     try:
                         X = df[FEATURES].values
                         y = df['ac_power'].values
+                        
                         scaler = StandardScaler()
                         X_scaled = scaler.fit_transform(X)
-                        X_seq, y_seq = create_lstm_sequences(X_scaled, y, lstm_seq_len)
 
-                        if len(X_seq) < 30:
-                            st.error("Not enough sequence samples. Reduce seq length or increase data.")
+                        X_seq, y_seq = create_lstm_sequences(X_scaled, y, lstm_seq_len)
+                        
+                        if len(X_seq) < 50:
+                            st.error("❌ Not enough sequence samples. Reduce sequence length or increase data size.")
                         else:
                             split_idx = int(len(X_seq) * (1 - test_size))
                             X_train_seq, X_test_seq = X_seq[:split_idx], X_seq[split_idx:]
@@ -335,6 +312,7 @@ with tab2:
                                 Dense(1, activation='linear')
                             ])
                             model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
                             es = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
                             history = model.fit(
@@ -348,6 +326,7 @@ with tab2:
 
                             y_pred_train = model.predict(X_train_seq, verbose=0).flatten()
                             y_pred_test = model.predict(X_test_seq, verbose=0).flatten()
+                            
                             rmse_train, r2_train, mae_train, mape_train = evaluate_regression(y_train_seq, y_pred_train)
                             rmse_test, r2_test, mae_test, mape_test = evaluate_regression(y_test_seq, y_pred_test)
 
@@ -365,336 +344,679 @@ with tab2:
                             }
                             st.session_state['lstm_trained'] = True
 
-                            st.success("✅ LSTM trained")
-                            c1,c2,c3,c4 = st.columns(4)
-                            c1.metric("RMSE (test)", f"{rmse_test:.2f}")
-                            c2.metric("R² (test)", f"{r2_test:.3f}")
-                            c3.metric("MAE (test)", f"{mae_test:.2f}")
-                            c4.metric("MAPE (test)", f"{mape_test:.2f}%")
+                            st.success("✅ LSTM trained successfully!")
+                            
+                            col_a, col_b, col_c, col_d = st.columns(4)
+                            col_a.metric("RMSE (Test)", f"{rmse_test:.2f}")
+                            col_b.metric("R² (Test)", f"{r2_test:.3f}")
+                            col_c.metric("MAE (Test)", f"{mae_test:.2f}")
+                            col_d.metric("MAPE (Test)", f"{mape_test:.2f}%")
 
                     except Exception as e:
-                        # note: if shap was imported earlier this error could appear; lazy import avoids that
-                        st.error(f"LSTM training failed: {e}")
-
+                        st.error(f"❌ LSTM training error: {e}")
+            
             if st.session_state.get('lstm_trained', False):
-                st.info("LSTM is trained")
+                st.info("✓ LSTM model is ready")
+                
+                # Show training history
                 if 'lstm_history' in st.session_state:
-                    hist = st.session_state['lstm_history']
+                    st.markdown("#### 📉 Training History")
+                    history = st.session_state['lstm_history']
+                    
                     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-                    ax1.plot(hist.get('loss', []), label='train loss')
-                    ax1.plot(hist.get('val_loss', []), label='val loss')
-                    ax1.set_title("Loss")
+                    
+                    ax1.plot(history['loss'], label='Train Loss', color='blue')
+                    ax1.plot(history['val_loss'], label='Val Loss', color='red')
+                    ax1.set_xlabel('Epoch')
+                    ax1.set_ylabel('Loss (MSE)')
+                    ax1.set_title('Loss Over Epochs')
                     ax1.legend()
-                    ax2.plot(hist.get('mae', []), label='train mae')
-                    ax2.plot(hist.get('val_mae', []), label='val mae')
-                    ax2.set_title("MAE")
+                    ax1.grid(alpha=0.3)
+                    
+                    ax2.plot(history['mae'], label='Train MAE', color='blue')
+                    ax2.plot(history['val_mae'], label='Val MAE', color='red')
+                    ax2.set_xlabel('Epoch')
+                    ax2.set_ylabel('MAE')
+                    ax2.set_title('MAE Over Epochs')
                     ax2.legend()
+                    ax2.grid(alpha=0.3)
+                    
                     st.pyplot(fig)
                     plt.close(fig)
 
-# ---------- Tab 3: XAI ----------
+# ---------- Tab 3: XAI (SHAP) ----------
 with tab3:
-    st.subheader("🔍 Explainable AI (SHAP)")
-
-    col_rf, col_lstm = st.columns(2)
-
-    # ---------- RF SHAP (lazy import) ----------
-    with col_rf:
-        st.markdown("### 🌲 SHAP for Random Forest")
-        if not st.session_state.get('rf_trained', False):
-            st.warning("Train RF first")
-        else:
-            if st.button("🔬 Compute SHAP (RF)", use_container_width=True):
-                with st.spinner("Computing SHAP for RF..."):
-                    try:
-                        # lazy import shap
-                        global SHAP_AVAILABLE
-                        if SHAP_AVAILABLE is None:
-                            try:
-                                import shap as _shap
-                                SHAP_AVAILABLE = True
-                                shap = _shap
-                            except Exception as e:
-                                SHAP_AVAILABLE = False
-                                st.error(f"Could not import shap: {e}")
-                                raise e
-                        else:
-                            # if previously imported, import into local name
-                            if SHAP_AVAILABLE:
-                                import importlib
-                                shap = importlib.import_module("shap")
-
-                        rf = st.session_state['rf_model']
-                        X_test_s = st.session_state['rf_X_test_s']
-                        expl = shap.TreeExplainer(rf)
-                        shap_values = expl.shap_values(X_test_s)
-                        st.session_state['rf_shap_values'] = shap_values
-                        st.success("✅ SHAP computed for RF")
-
-                        # Summary plot
-                        fig = plt.figure(figsize=(10,6))
-                        shap.summary_plot(shap_values, X_test_s, feature_names=FEATURES, show=False)
-                        st.pyplot(fig)
-                        plt.close(fig)
-
-                        # Importance bar
-                        avg_imp = np.mean(np.abs(shap_values), axis=0)
-                        imp_df = pd.DataFrame({'feature': FEATURES, 'importance': avg_imp}).sort_values('importance', ascending=True)
-                        fig2, ax2 = plt.subplots(figsize=(8,6))
-                        ax2.barh(imp_df['feature'], imp_df['importance'])
-                        ax2.set_title("RF SHAP mean(|value|)")
-                        st.pyplot(fig2)
-                        plt.close(fig2)
-
-                    except Exception as e:
-                        st.error(f"SHAP RF error: {e}")
-
-    # ---------- LSTM SHAP (lazy import + robust) ----------
-    with col_lstm:
-        st.markdown("### 🧠 SHAP for LSTM (Deep -> Gradient -> Permutation fallback)")
-        if not st.session_state.get('lstm_trained', False):
-            st.warning("Train LSTM first")
-        elif not TF_AVAILABLE:
-            st.error("TensorFlow not available")
-        else:
-            if st.button("🔬 Compute SHAP (LSTM)", use_container_width=True):
-                with st.spinner("Computing SHAP values for LSTM (attempting Deep->Gradient->Permutation)..."):
-                    try:
-                        # lazy import shap
-                        global SHAP_AVAILABLE
-                        shap = None
-                        if SHAP_AVAILABLE is None:
-                            try:
-                                import shap as _shap
-                                SHAP_AVAILABLE = True
-                                shap = _shap
-                            except Exception as e:
-                                SHAP_AVAILABLE = False
-                                shap = None
-                                st.warning(f"Could not import shap: {e}. Will try permutation fallback.")
-                        else:
-                            if SHAP_AVAILABLE:
-                                import importlib
-                                shap = importlib.import_module("shap")
-
-                        model = st.session_state['lstm_model']
-                        X_test_seq = st.session_state.get('lstm_X_test_seq', None)
-                        feat_names = FEATURES
-
-                        if X_test_seq is None or len(X_test_seq) == 0:
-                            st.error("No LSTM test sequences found. Retrain with more data or shorter seq length.")
-                        else:
-                            sample = X_test_seq[:min(200, len(X_test_seq))]
-                            background = X_test_seq[:min(50, len(X_test_seq))]
-
-                            arr = None
-                            expl_used = None
-
-                            # Attempt DeepExplainer
-                            if shap is not None:
-                                try:
-                                    expl = shap.DeepExplainer(model, background)
-                                    shap_values = expl.shap_values(sample)
-                                    arr = np.array(shap_values[0]) if isinstance(shap_values, list) else np.array(shap_values)
-                                    expl_used = "DeepExplainer"
-                                except Exception as e_deep:
-                                    st.warning(f"DeepExplainer failed: {e_deep!s}. Trying GradientExplainer...")
-
-                            # Attempt GradientExplainer
-                            if arr is None and shap is not None:
-                                try:
-                                    expl = shap.GradientExplainer(model, background)
-                                    shap_values = expl.shap_values(sample)
-                                    arr = np.array(shap_values[0]) if isinstance(shap_values, list) else np.array(shap_values)
-                                    expl_used = "GradientExplainer"
-                                except Exception as e_grad:
-                                    st.warning(f"GradientExplainer failed: {e_grad!s}. Falling back to permutation importance.")
-
-                            # Permutation fallback
-                            if arr is None:
-                                st.info("Permutation fallback: estimating importance by shuffling features (model-agnostic). This may be slow.")
-                                try:
-                                    preds_base = model.predict(sample, verbose=0).flatten()
-                                    n_samples, seq_len, n_feat = sample.shape
-                                    mean_imp = np.zeros(n_feat)
-                                    for fi in range(n_feat):
-                                        sample_perm = sample.copy()
-                                        # shuffle feature fi across samples for each timestep
-                                        for t in range(seq_len):
-                                            np.random.shuffle(sample_perm[:, t, fi])
-                                        preds_perm = model.predict(sample_perm, verbose=0).flatten()
-                                        mean_imp[fi] = np.mean(np.abs(preds_base - preds_perm))
-                                    arr = np.zeros((n_samples, seq_len, n_feat))
-                                    for fi in range(n_feat):
-                                        arr[:, :, fi] = mean_imp[fi]
-                                    expl_used = "PermutationFallback"
-                                except Exception as e_perm:
-                                    st.error(f"Permutation fallback failed: {e_perm!s}")
-                                    arr = None
-
-                            # Visualize if arr available
-                            if arr is not None:
-                                st.success(f"SHAP-like importances computed (method={expl_used})")
-                                abs_arr = np.abs(arr)
-                                mean_over_samples = np.mean(abs_arr, axis=0)  # (seq_len, n_features)
-                                mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (n_features,)
-
-                                imp_df = pd.DataFrame({'feature': feat_names, 'importance': mean_feat_imp}).sort_values('importance', ascending=True)
-                                fig1, ax1 = plt.subplots(figsize=(8,6))
-                                ax1.barh(imp_df['feature'], imp_df['importance'])
-                                ax1.set_title(f"LSTM feature importance (method={expl_used})")
+    st.subheader("🔍 Explainable AI dengan SHAP")
+    
+    if not SHAP_AVAILABLE:
+        st.error("⚠️ SHAP not installed. Install with: `pip install shap`")
+    else:
+        shap_col1, shap_col2 = st.columns(2)
+        
+        # SHAP for Random Forest
+        with shap_col1:
+            st.markdown("### 🌲 SHAP for Random Forest")
+            
+            if not st.session_state.get('rf_trained', False):
+                st.warning("⚠️ Train Random Forest model first")
+            else:
+                if st.button("🔬 Compute SHAP (RF)", use_container_width=True):
+                    with st.spinner("Computing SHAP values for Random Forest..."):
+                        try:
+                            rf = st.session_state['rf_model']
+                            X_test_s = st.session_state['rf_X_test_s']
+                            
+                            explainer = shap.TreeExplainer(rf)
+                            shap_values = explainer.shap_values(X_test_s)
+                            
+                            st.session_state['rf_shap_values'] = shap_values
+                            st.session_state['rf_shap_explainer'] = explainer
+                            
+                            st.success("✅ SHAP computed for RF")
+                            
+                            # Summary plot
+                            st.markdown("#### Feature Impact Summary")
+                            fig1 = plt.figure(figsize=(10, 6))
+                            shap.summary_plot(shap_values, X_test_s, feature_names=FEATURES, show=False)
+                            st.pyplot(fig1)
+                            plt.close(fig1)
+                            
+                            # Feature importance
+                            st.markdown("#### Feature Importance (Mean |SHAP|)")
+                            avg_imp = np.mean(np.abs(shap_values), axis=0)
+                            imp_df = pd.DataFrame({
+                                'feature': FEATURES, 
+                                'importance': avg_imp
+                            }).sort_values('importance', ascending=True)
+                            
+                            fig2, ax2 = plt.subplots(figsize=(8, 6))
+                            colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(imp_df)))
+                            ax2.barh(imp_df['feature'], imp_df['importance'], color=colors)
+                            ax2.set_xlabel('Mean |SHAP Value|', fontsize=12)
+                            ax2.set_title('RF Feature Importance via SHAP', fontsize=14, fontweight='bold')
+                            ax2.grid(axis='x', alpha=0.3)
+                            st.pyplot(fig2)
+                            plt.close(fig2)
+                            
+                        except Exception as e:
+                            st.error(f"❌ SHAP RF error: {e}")
+        
+        # SHAP for LSTM
+        with shap_col2:
+            st.markdown("### 🧠 SHAP for LSTM")
+            
+            if not st.session_state.get('lstm_trained', False):
+                st.warning("⚠️ Train LSTM model first")
+            elif not TF_AVAILABLE:
+                st.error("⚠️ TensorFlow not available")
+            else:
+                shap_method = st.radio("SHAP Method for LSTM", 
+                                      ["KernelExplainer (Slower, More Accurate)", 
+                                       "Gradient-based (Experimental)",
+                                       "Permutation Importance (Fast Alternative)"],
+                                      key="lstm_shap_method")
+                
+                if st.button("🔬 Compute SHAP (LSTM)", use_container_width=True):
+                    with st.spinner("Computing explainability for LSTM..."):
+                        try:
+                            model = st.session_state['lstm_model']
+                            X_test_seq = st.session_state['lstm_X_test_seq']
+                            y_test_seq = st.session_state['lstm_y_test']
+                            
+                            if len(X_test_seq) < 10:
+                                st.error("❌ Not enough test samples for SHAP")
+                            else:
+                                if "Permutation" in shap_method:
+                                    # Use Permutation Importance as fast alternative
+                                    st.info("Computing Permutation Importance - fast and model-agnostic...")
+                                    
+                                    sample_size = min(500, len(X_test_seq))
+                                    X_sample = X_test_seq[:sample_size]
+                                    y_sample = y_test_seq[:sample_size]
+                                    
+                                    # Calculate baseline score
+                                    baseline_pred = model.predict(X_sample, verbose=0).flatten()
+                                    baseline_score = r2_score(y_sample, baseline_pred)
+                                    
+                                    # Permutation importance for each feature
+                                    feature_importance = []
+                                    
+                                    progress_bar = st.progress(0)
+                                    for feat_idx in range(len(FEATURES)):
+                                        importance_scores = []
+                                        
+                                        # Repeat permutation multiple times
+                                        for _ in range(5):
+                                            X_permuted = X_sample.copy()
+                                            # Permute feature across all timesteps
+                                            X_permuted[:, :, feat_idx] = np.random.permutation(X_permuted[:, :, feat_idx].flatten()).reshape(X_permuted[:, :, feat_idx].shape)
+                                            
+                                            perm_pred = model.predict(X_permuted, verbose=0).flatten()
+                                            perm_score = r2_score(y_sample, perm_pred)
+                                            importance_scores.append(baseline_score - perm_score)
+                                        
+                                        feature_importance.append(np.mean(importance_scores))
+                                        progress_bar.progress((feat_idx + 1) / len(FEATURES))
+                                    
+                                    progress_bar.empty()
+                                    
+                                    mean_feat_imp = np.array(feature_importance)
+                                    mean_over_samples = None
+                                    
+                                    st.success("✅ Permutation Importance computed for LSTM")
+                                    
+                                elif "KernelExplainer" in shap_method:
+                                    # Use KernelExplainer - more stable for LSTM
+                                    st.info("Using KernelExplainer - this may take a few moments...")
+                                    
+                                    # Prepare data
+                                    sample_size = min(100, len(X_test_seq))
+                                    background = X_test_seq[:min(50, len(X_test_seq))]
+                                    sample = X_test_seq[:sample_size]
+                                    
+                                    # Create a prediction function
+                                    def predict_fn(x):
+                                        return model.predict(x, verbose=0).flatten()
+                                    
+                                    # Use KernelExplainer
+                                    explainer = shap.KernelExplainer(predict_fn, background)
+                                    shap_values = explainer.shap_values(sample, nsamples=100)
+                                    
+                                    shap_array = np.array(shap_values)
+                                    
+                                else:
+                                    # Try GradientExplainer as alternative
+                                    st.info("Using GradientExplainer...")
+                                    
+                                    background = X_test_seq[:min(100, len(X_test_seq))]
+                                    sample = X_test_seq[:min(200, len(X_test_seq))]
+                                    
+                                    try:
+                                        explainer = shap.GradientExplainer(model, background)
+                                        shap_values = explainer.shap_values(sample)
+                                        
+                                        if isinstance(shap_values, list):
+                                            shap_array = np.array(shap_values[0])
+                                        else:
+                                            shap_array = np.array(shap_values)
+                                    except Exception as grad_error:
+                                        st.warning(f"GradientExplainer failed: {grad_error}")
+                                        st.info("Falling back to KernelExplainer...")
+                                        
+                                        # Fallback to KernelExplainer
+                                        sample_size = min(50, len(X_test_seq))
+                                        background = X_test_seq[:min(30, len(X_test_seq))]
+                                        sample = X_test_seq[:sample_size]
+                                        
+                                        def predict_fn(x):
+                                            return model.predict(x, verbose=0).flatten()
+                                        
+                                        explainer = shap.KernelExplainer(predict_fn, background)
+                                        shap_values = explainer.shap_values(sample, nsamples=50)
+                                        shap_array = np.array(shap_values)
+                                
+                                st.session_state['lstm_shap_values'] = shap_array
+                                
+                                st.success("✅ SHAP computed for LSTM")
+                                
+                                # Feature importance averaged over timesteps and samples
+                                abs_shap = np.abs(shap_array)
+                                
+                                # Handle different shapes
+                                if len(abs_shap.shape) == 3:  # (samples, timesteps, features)
+                                    mean_over_samples = np.mean(abs_shap, axis=0)  # (timesteps, features)
+                                    mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (features,)
+                                elif len(abs_shap.shape) == 2:  # (samples, features) - flattened
+                                    n_features = len(FEATURES)
+                                    # Reshape if possible
+                                    if abs_shap.shape[1] % n_features == 0:
+                                        seq_len = abs_shap.shape[1] // n_features
+                                        reshaped = abs_shap.reshape(-1, seq_len, n_features)
+                                        mean_over_samples = np.mean(reshaped, axis=0)
+                                        mean_feat_imp = np.mean(mean_over_samples, axis=0)
+                                    else:
+                                        # Just average over samples for each feature
+                                        mean_feat_imp = np.mean(abs_shap[:, :n_features], axis=0)
+                                        mean_over_samples = None
+                                else:
+                                    mean_feat_imp = np.mean(abs_shap, axis=0)
+                                    mean_over_samples = None
+                                
+                                # Feature importance plot
+                                st.markdown("#### Feature Importance (Avg over timesteps)")
+                                
+                                # Normalize importance values for better visualization
+                                if np.max(np.abs(mean_feat_imp)) > 0:
+                                    normalized_imp = mean_feat_imp / np.max(np.abs(mean_feat_imp))
+                                else:
+                                    normalized_imp = mean_feat_imp
+                                
+                                imp_df = pd.DataFrame({
+                                    'feature': FEATURES[:len(mean_feat_imp)], 
+                                    'importance': mean_feat_imp,
+                                    'normalized': normalized_imp
+                                }).sort_values('importance', ascending=True)
+                                
+                                fig1, ax1 = plt.subplots(figsize=(8, 6))
+                                colors = plt.cm.plasma(np.linspace(0.3, 0.9, len(imp_df)))
+                                bars = ax1.barh(imp_df['feature'], imp_df['importance'], color=colors)
+                                ax1.set_xlabel('Feature Importance Score', fontsize=12)
+                                
+                                if "Permutation" in shap_method:
+                                    ax1.set_title('LSTM Feature Importance (Permutation)', fontsize=14, fontweight='bold')
+                                else:
+                                    ax1.set_title('LSTM Feature Importance via SHAP', fontsize=14, fontweight='bold')
+                                    
+                                ax1.grid(axis='x', alpha=0.3)
+                                
+                                # Add value labels
+                                for bar in bars:
+                                    width = bar.get_width()
+                                    ax1.text(width, bar.get_y() + bar.get_height()/2, 
+                                            f'{width:.4f}', ha='left', va='center', fontsize=9)
+                                
                                 st.pyplot(fig1)
                                 plt.close(fig1)
-
-                                fig2, ax2 = plt.subplots(figsize=(10,6))
-                                sns.heatmap(mean_over_samples.T, cmap='viridis', yticklabels=feat_names, xticklabels=False, ax=ax2)
-                                ax2.set_xlabel("Timestep")
-                                ax2.set_ylabel("Feature")
-                                ax2.set_title("Importance per Timestep × Feature")
-                                st.pyplot(fig2)
-                                plt.close(fig2)
-                            else:
-                                st.error("Failed to compute SHAP-like importances for LSTM.")
-                    except Exception as e_all:
-                        st.error(f"Unexpected error during LSTM SHAP: {e_all!s}")
+                                
+                                # Heatmap: timestep x feature (if available)
+                                if mean_over_samples is not None and len(mean_over_samples.shape) == 2:
+                                    st.markdown("#### SHAP Heatmap (Feature × Timestep)")
+                                    fig2, ax2 = plt.subplots(figsize=(10, 6))
+                                    sns.heatmap(mean_over_samples.T, cmap='viridis', 
+                                               yticklabels=FEATURES, xticklabels=False, ax=ax2,
+                                               cbar_kws={'label': 'Mean |SHAP|'})
+                                    ax2.set_xlabel("Timestep in Sequence", fontsize=12)
+                                    ax2.set_ylabel("Feature", fontsize=12)
+                                    ax2.set_title("SHAP Impact Across Time", fontsize=14, fontweight='bold')
+                                    st.pyplot(fig2)
+                                    plt.close(fig2)
+                                
+                                # Summary statistics
+                                st.markdown("#### 📊 Feature Importance Statistics")
+                                shap_stats = pd.DataFrame({
+                                    'Feature': FEATURES[:len(mean_feat_imp)],
+                                    'Importance': mean_feat_imp,
+                                    'Abs Importance': np.abs(mean_feat_imp),
+                                    'Rank': range(1, len(mean_feat_imp) + 1)
+                                }).sort_values('Abs Importance', ascending=False)
+                                shap_stats['Rank'] = range(1, len(shap_stats) + 1)
+                                
+                                st.dataframe(shap_stats.style.format({
+                                    'Importance': '{:.6f}',
+                                    'Abs Importance': '{:.6f}'
+                                }).background_gradient(subset=['Abs Importance'], cmap='YlOrRd'), 
+                                use_container_width=True)
+                                
+                                # Method explanation
+                                if "Permutation" in shap_method:
+                                    st.info("""
+                                    **Permutation Importance:** Measures the decrease in model performance 
+                                    when a feature's values are randomly shuffled. Higher values indicate 
+                                    more important features.
+                                    """)
+                                else:
+                                    st.info("""
+                                    **SHAP Values:** Show the impact of each feature on model predictions. 
+                                    Positive values increase predictions, negative values decrease them.
+                                    """)
+                                
+                        except Exception as e:
+                            st.error(f"❌ SHAP LSTM error: {e}")
+                            st.info("""
+                            💡 **Troubleshooting Tips:**
+                            - Try using KernelExplainer method (slower but more stable)
+                            - Reduce the number of samples
+                            - Ensure TensorFlow version is compatible with SHAP
+                            - Alternative: Use feature permutation importance instead
+                            """)
 
 # ---------- Tab 4: Predictions ----------
 with tab4:
     st.subheader("📈 Manual Predictions")
+    
     st.markdown("### Input Features")
-    c1,c2,c3,c4 = st.columns(4)
-    with c1:
+    cols = st.columns(4)
+    with cols[0]:
         irr = st.number_input("☀️ Irradiance (W/m²)", 0.0, 1200.0, 500.0, 10.0)
         amb = st.number_input("🌡️ Ambient Temp (°C)", -10.0, 50.0, 25.0, 0.5)
-    with c2:
+    with cols[1]:
         modt = st.number_input("🔥 Module Temp (°C)", 0.0, 90.0, 45.0, 0.5)
         hum = st.number_input("💧 Humidity (%)", 0.0, 100.0, 50.0, 1.0)
-    with c3:
+    with cols[2]:
         wind = st.number_input("💨 Wind Speed (m/s)", 0.0, 30.0, 5.0, 0.5)
         pres = st.number_input("📊 Pressure (hPa)", 900.0, 1100.0, 1013.0, 1.0)
-    with c4:
+    with cols[3]:
         cloud = st.number_input("☁️ Cloud Cover (%)", 0.0, 100.0, 30.0, 1.0)
         eff = st.number_input("⚡ Panel Efficiency (%)", 10.0, 25.0, 18.0, 0.1)
-
+    
     X_input = np.array([[irr, amb, modt, hum, wind, pres, cloud, eff]])
-
-    col_pred1, col_pred2 = st.columns(2)
-    # RF pred
-    with col_pred1:
-        st.markdown("### 🌲 Random Forest")
+    
+    pred_col1, pred_col2 = st.columns(2)
+    
+    # RF Prediction
+    with pred_col1:
+        st.markdown("### 🌲 Random Forest Prediction")
         if not st.session_state.get('rf_trained', False):
-            st.warning("Train RF first")
+            st.warning("⚠️ Train RF model first")
         else:
             if st.button("🔮 Predict with RF", use_container_width=True):
                 try:
-                    rf = st.session_state['rf_model']
+                    model = st.session_state['rf_model']
                     scaler = st.session_state['rf_scaler']
-                    Xs = scaler.transform(X_input)
-                    pred = rf.predict(Xs)[0]
-                    st.success(f"🎯 Predicted AC Power (RF): {pred:.2f} W")
-                    est_eff = (pred / max(irr, 1e-6)) * 100
-                    est_daily = pred * 24 / 1000
-                    st.write(f"Estimated efficiency: **{est_eff:.2f}%**")
-                    st.write(f"Estimated daily energy: **{est_daily:.2f} kWh**")
+                    X_scaled = scaler.transform(X_input)
+                    pred = model.predict(X_scaled)[0]
+                    
+                    st.success(f"### 🎯 Predicted AC Power: **{pred:.2f} W**")
+                    
+                    # Show feature contribution if SHAP available
+                    if 'rf_shap_explainer' in st.session_state:
+                        st.markdown("#### Feature Contributions")
+                        explainer = st.session_state['rf_shap_explainer']
+                        shap_values_single = explainer.shap_values(X_scaled)
+                        
+                        contrib_df = pd.DataFrame({
+                            'Feature': FEATURES,
+                            'Value': X_input[0],
+                            'SHAP': shap_values_single[0]
+                        })
+                        contrib_df['Abs_SHAP'] = np.abs(contrib_df['SHAP'])
+                        contrib_df = contrib_df.sort_values('Abs_SHAP', ascending=False)
+                        
+                        fig, ax = plt.subplots(figsize=(8, 5))
+                        colors = ['green' if x > 0 else 'red' for x in contrib_df['SHAP']]
+                        ax.barh(contrib_df['Feature'], contrib_df['SHAP'], color=colors, alpha=0.7)
+                        ax.set_xlabel('SHAP Value (Impact on Prediction)')
+                        ax.set_title('Feature Contribution to Prediction')
+                        ax.axvline(0, color='black', linestyle='--', linewidth=0.8)
+                        ax.grid(axis='x', alpha=0.3)
+                        st.pyplot(fig)
+                        plt.close(fig)
+                        
                 except Exception as e:
-                    st.error(f"RF predict error: {e}")
-
-    # LSTM pred
-    with col_pred2:
-        st.markdown("### 🧠 LSTM")
+                    st.error(f"❌ RF prediction error: {e}")
+    
+    # LSTM Prediction
+    with pred_col2:
+        st.markdown("### 🧠 LSTM Prediction")
         if not st.session_state.get('lstm_trained', False):
-            st.warning("Train LSTM first")
+            st.warning("⚠️ Train LSTM model first")
         elif not TF_AVAILABLE:
-            st.error("TensorFlow not available")
+            st.error("⚠️ TensorFlow not available")
         else:
             if st.button("🔮 Predict with LSTM", use_container_width=True):
                 try:
                     model = st.session_state['lstm_model']
                     scaler = st.session_state['lstm_scaler']
-                    seq_len = st.session_state.get('lstm_seq_len', lstm_seq_len)
-                    Xs = scaler.transform(X_input)  # (1, n_features)
-
-                    # try to build realistic sequence using last test sequence
-                    if 'lstm_X_test_seq' in st.session_state and st.session_state['lstm_X_test_seq'] is not None and len(st.session_state['lstm_X_test_seq'])>0:
+                    seq_len = st.session_state['lstm_seq_len']
+                    
+                    X_scaled = scaler.transform(X_input)
+                    
+                    # Build sequence from last test data
+                    if 'lstm_X_test_seq' in st.session_state and len(st.session_state['lstm_X_test_seq']) > 0:
                         last_seq = st.session_state['lstm_X_test_seq'][-1].copy()
-                        if last_seq.shape[0] >= seq_len:
-                            seq = np.vstack([last_seq[1:], Xs[0]])
-                        else:
-                            seq = np.vstack([last_seq, np.tile(Xs[0], (seq_len - last_seq.shape[0], 1))])
-                        seq = seq.reshape(1, seq.shape[0], seq.shape[1])
+                        # Append new input and keep last seq_len timesteps
+                        new_seq = np.vstack([last_seq[1:], X_scaled[0]])
+                        seq = new_seq.reshape(1, seq_len, -1)
                     else:
-                        seq = np.tile(Xs.reshape(1,1,-1), (1, seq_len, 1))
-
-                    pred_lstm = model.predict(seq, verbose=0).flatten()[0]
-                    st.success(f"🎯 Predicted AC Power (LSTM): {pred_lstm:.2f} W")
-                    est_eff_l = (pred_lstm / max(irr, 1e-6)) * 100
-                    est_daily_l = pred_lstm * 24 / 1000
-                    st.write(f"Estimated efficiency: **{est_eff_l:.2f}%**")
-                    st.write(f"Estimated daily energy: **{est_daily_l:.2f} kWh**")
+                        # Fallback: repeat current input
+                        seq = np.tile(X_scaled.reshape(1, 1, -1), (1, seq_len, 1))
+                    
+                    pred = model.predict(seq, verbose=0).flatten()[0]
+                    
+                    st.success(f"### 🎯 Predicted AC Power: **{pred:.2f} W**")
+                    
+                    st.info("💡 LSTM uses sequence of past timesteps. This prediction uses the last sequence from test data with your input appended.")
+                    
                 except Exception as e:
-                    st.error(f"LSTM predict error: {e}")
+                    st.error(f"❌ LSTM prediction error: {e}")
 
 # ---------- Tab 5: Model Comparison ----------
 with tab5:
     st.subheader("⚖️ Model Comparison")
-    rf_ready = st.session_state.get('rf_trained', False)
-    lstm_ready = st.session_state.get('lstm_trained', False)
-
-    if not rf_ready and not lstm_ready:
-        st.info("Train at least one model to compare.")
+    
+    if not st.session_state.get('rf_trained', False) and not st.session_state.get('lstm_trained', False):
+        st.warning("⚠️ Train both models to see comparison")
     else:
-        c1, c2 = st.columns(2)
-        if rf_ready:
-            with c1:
-                st.markdown("### 🌲 Random Forest Metrics")
-                m = st.session_state.get('rf_metrics', None)
-                if m:
-                    st.write(f"- RMSE (test): **{m['rmse_test']:.2f}**")
-                    st.write(f"- R² (test): **{m['r2_test']:.3f}**")
-                    st.write(f"- MAE (test): **{m['mae_test']:.2f}**")
-                    st.write(f"- MAPE (test): **{m['mape_test']:.2f}%**")
-                else:
-                    st.write("No RF metrics stored.")
-                rf_model = st.session_state.get('rf_model', None)
-                if rf_model is not None:
-                    try:
-                        imp = rf_model.feature_importances_
-                        fi_df = pd.DataFrame({'feature': FEATURES, 'importance': imp}).sort_values('importance', ascending=False)
-                        st.markdown("Top RF features")
-                        st.table(fi_df.head(8).set_index('feature'))
-                    except Exception:
-                        pass
-        else:
-            with c1:
-                st.info("RF not trained")
-
-        if lstm_ready:
-            with c2:
-                st.markdown("### 🧠 LSTM Metrics")
-                lm = st.session_state.get('lstm_metrics', None)
-                if lm:
-                    st.write(f"- RMSE (test): **{lm['rmse_test']:.2f}**")
-                    st.write(f"- R² (test): **{lm['r2_test']:.3f}**")
-                    st.write(f"- MAE (test): **{lm['mae_test']:.2f}**")
-                    st.write(f"- MAPE (test): **{lm['mape_test']:.2f}%**")
-                else:
-                    st.write("No LSTM metrics stored.")
-                if 'lstm_y_test' in st.session_state and 'lstm_y_pred' in st.session_state:
-                    try:
-                        y_t = st.session_state['lstm_y_test']
-                        y_p = st.session_state['lstm_y_pred']
-                        fig, ax = plt.subplots(figsize=(8,4))
-                        ax.plot(y_t[:200], label='actual')
-                        ax.plot(y_p[:200], label='pred')
-                        ax.legend()
-                        st.pyplot(fig)
-                        plt.close(fig)
-                    except Exception:
-                        pass
-        else:
-            with c2:
-                st.info("LSTM not trained")
+        # Metrics Comparison
+        st.markdown("### 📊 Performance Metrics Comparison")
+        
+        comparison_data = []
+        
+        if st.session_state.get('rf_trained', False):
+            rf_metrics = st.session_state['rf_metrics']
+            comparison_data.append({
+                'Model': 'Random Forest',
+                'RMSE (Train)': rf_metrics['rmse_train'],
+                'RMSE (Test)': rf_metrics['rmse_test'],
+                'R² (Train)': rf_metrics['r2_train'],
+                'R² (Test)': rf_metrics['r2_test'],
+                'MAE (Train)': rf_metrics['mae_train'],
+                'MAE (Test)': rf_metrics['mae_test'],
+                'MAPE (Test)': rf_metrics['mape_test']
+            })
+        
+        if st.session_state.get('lstm_trained', False):
+            lstm_metrics = st.session_state['lstm_metrics']
+            comparison_data.append({
+                'Model': 'LSTM',
+                'RMSE (Train)': lstm_metrics['rmse_train'],
+                'RMSE (Test)': lstm_metrics['rmse_test'],
+                'R² (Train)': lstm_metrics['r2_train'],
+                'R² (Test)': lstm_metrics['r2_test'],
+                'MAE (Train)': lstm_metrics['mae_train'],
+                'MAE (Test)': lstm_metrics['mae_test'],
+                'MAPE (Test)': lstm_metrics['mape_test']
+            })
+        
+        if comparison_data:
+            comp_df = pd.DataFrame(comparison_data)
+            st.dataframe(comp_df.style.highlight_min(subset=['RMSE (Test)', 'MAE (Test)', 'MAPE (Test)'], color='lightgreen')
+                                     .highlight_max(subset=['R² (Test)'], color='lightgreen'), 
+                        use_container_width=True)
+            
+            # Visual comparison
+            st.markdown("### 📈 Visual Performance Comparison")
+            
+            if len(comparison_data) == 2:
+                metrics_to_plot = ['RMSE (Test)', 'MAE (Test)', 'R² (Test)', 'MAPE (Test)']
+                
+                fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+                axes = axes.flatten()
+                
+                for idx, metric in enumerate(metrics_to_plot):
+                    ax = axes[idx]
+                    values = [comp_df.loc[comp_df['Model'] == 'Random Forest', metric].values[0],
+                             comp_df.loc[comp_df['Model'] == 'LSTM', metric].values[0]]
+                    
+                    colors = ['#FF6B35', '#004E89']
+                    bars = ax.bar(['Random Forest', 'LSTM'], values, color=colors, alpha=0.7, edgecolor='black')
+                    
+                    # Add value labels on bars
+                    for bar in bars:
+                        height = bar.get_height()
+                        ax.text(bar.get_x() + bar.get_width()/2., height,
+                               f'{height:.3f}',
+                               ha='center', va='bottom', fontweight='bold')
+                    
+                    ax.set_ylabel(metric, fontsize=11, fontweight='bold')
+                    ax.set_title(f'{metric} Comparison', fontsize=12, fontweight='bold')
+                    ax.grid(axis='y', alpha=0.3)
+                    
+                    # Highlight better model
+                    if metric == 'R² (Test)':
+                        best_idx = np.argmax(values)
+                    else:
+                        best_idx = np.argmin(values)
+                    bars[best_idx].set_edgecolor('gold')
+                    bars[best_idx].set_linewidth(3)
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+        
+        # Prediction Comparison on Test Set
+        if st.session_state.get('rf_trained', False) and st.session_state.get('lstm_trained', False):
+            st.markdown("### 🎯 Predictions vs Actual (Test Set)")
+            
+            rf_y_test = st.session_state['rf_y_test']
+            rf_y_pred = st.session_state['rf_y_pred']
+            lstm_y_test = st.session_state['lstm_y_test']
+            lstm_y_pred = st.session_state['lstm_y_pred']
+            
+            # Use minimum length for comparison
+            min_len = min(len(rf_y_test), len(lstm_y_test), 500)
+            
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+            
+            # RF: Actual vs Predicted
+            axes[0, 0].scatter(rf_y_test[:min_len], rf_y_pred[:min_len], alpha=0.5, s=20, color='#FF6B35')
+            axes[0, 0].plot([rf_y_test[:min_len].min(), rf_y_test[:min_len].max()], 
+                           [rf_y_test[:min_len].min(), rf_y_test[:min_len].max()], 
+                           'k--', lw=2, label='Perfect Prediction')
+            axes[0, 0].set_xlabel('Actual AC Power (W)', fontsize=11)
+            axes[0, 0].set_ylabel('Predicted AC Power (W)', fontsize=11)
+            axes[0, 0].set_title('Random Forest: Actual vs Predicted', fontsize=12, fontweight='bold')
+            axes[0, 0].legend()
+            axes[0, 0].grid(alpha=0.3)
+            
+            # LSTM: Actual vs Predicted
+            axes[0, 1].scatter(lstm_y_test[:min_len], lstm_y_pred[:min_len], alpha=0.5, s=20, color='#004E89')
+            axes[0, 1].plot([lstm_y_test[:min_len].min(), lstm_y_test[:min_len].max()], 
+                           [lstm_y_test[:min_len].min(), lstm_y_test[:min_len].max()], 
+                           'k--', lw=2, label='Perfect Prediction')
+            axes[0, 1].set_xlabel('Actual AC Power (W)', fontsize=11)
+            axes[0, 1].set_ylabel('Predicted AC Power (W)', fontsize=11)
+            axes[0, 1].set_title('LSTM: Actual vs Predicted', fontsize=12, fontweight='bold')
+            axes[0, 1].legend()
+            axes[0, 1].grid(alpha=0.3)
+            
+            # RF: Residuals
+            rf_residuals = rf_y_test[:min_len] - rf_y_pred[:min_len]
+            axes[1, 0].scatter(rf_y_pred[:min_len], rf_residuals, alpha=0.5, s=20, color='#FF6B35')
+            axes[1, 0].axhline(y=0, color='k', linestyle='--', lw=2)
+            axes[1, 0].set_xlabel('Predicted AC Power (W)', fontsize=11)
+            axes[1, 0].set_ylabel('Residuals (W)', fontsize=11)
+            axes[1, 0].set_title('Random Forest: Residual Plot', fontsize=12, fontweight='bold')
+            axes[1, 0].grid(alpha=0.3)
+            
+            # LSTM: Residuals
+            lstm_residuals = lstm_y_test[:min_len] - lstm_y_pred[:min_len]
+            axes[1, 1].scatter(lstm_y_pred[:min_len], lstm_residuals, alpha=0.5, s=20, color='#004E89')
+            axes[1, 1].axhline(y=0, color='k', linestyle='--', lw=2)
+            axes[1, 1].set_xlabel('Predicted AC Power (W)', fontsize=11)
+            axes[1, 1].set_ylabel('Residuals (W)', fontsize=11)
+            axes[1, 1].set_title('LSTM: Residual Plot', fontsize=12, fontweight='bold')
+            axes[1, 1].grid(alpha=0.3)
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Time series comparison
+            st.markdown("### 📉 Time Series Comparison (First 200 Test Samples)")
+            
+            n_samples = min(200, min_len)
+            x_axis = np.arange(n_samples)
+            
+            fig, ax = plt.subplots(figsize=(16, 6))
+            ax.plot(x_axis, rf_y_test[:n_samples], label='Actual', color='black', linewidth=2, alpha=0.7)
+            ax.plot(x_axis, rf_y_pred[:n_samples], label='RF Prediction', color='#FF6B35', linewidth=1.5, alpha=0.8)
+            ax.plot(x_axis, lstm_y_pred[:n_samples], label='LSTM Prediction', color='#004E89', linewidth=1.5, alpha=0.8)
+            ax.set_xlabel('Sample Index', fontsize=12)
+            ax.set_ylabel('AC Power (W)', fontsize=12)
+            ax.set_title('Model Predictions vs Actual Values Over Time', fontsize=14, fontweight='bold')
+            ax.legend(loc='best', fontsize=11)
+            ax.grid(alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Error distribution comparison
+            st.markdown("### 📊 Error Distribution Comparison")
+            
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            axes[0].hist(rf_residuals, bins=50, color='#FF6B35', alpha=0.7, edgecolor='black')
+            axes[0].axvline(0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+            axes[0].set_xlabel('Residual (W)', fontsize=11)
+            axes[0].set_ylabel('Frequency', fontsize=11)
+            axes[0].set_title('Random Forest: Error Distribution', fontsize=12, fontweight='bold')
+            axes[0].legend()
+            axes[0].grid(alpha=0.3)
+            
+            axes[1].hist(lstm_residuals, bins=50, color='#004E89', alpha=0.7, edgecolor='black')
+            axes[1].axvline(0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+            axes[1].set_xlabel('Residual (W)', fontsize=11)
+            axes[1].set_ylabel('Frequency', fontsize=11)
+            axes[1].set_title('LSTM: Error Distribution', fontsize=12, fontweight='bold')
+            axes[1].legend()
+            axes[1].grid(alpha=0.3)
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            
+            # Summary statistics
+            st.markdown("### 📋 Residual Statistics")
+            
+            residual_stats = pd.DataFrame({
+                'Model': ['Random Forest', 'LSTM'],
+                'Mean Error': [np.mean(rf_residuals), np.mean(lstm_residuals)],
+                'Std Error': [np.std(rf_residuals), np.std(lstm_residuals)],
+                'Min Error': [np.min(rf_residuals), np.min(lstm_residuals)],
+                'Max Error': [np.max(rf_residuals), np.max(lstm_residuals)],
+                'Median Error': [np.median(rf_residuals), np.median(lstm_residuals)]
+            })
+            
+            st.dataframe(residual_stats.style.format({
+                'Mean Error': '{:.2f}',
+                'Std Error': '{:.2f}',
+                'Min Error': '{:.2f}',
+                'Max Error': '{:.2f}',
+                'Median Error': '{:.2f}'
+            }), use_container_width=True)
+            
+            # Model recommendation
+            st.markdown("### 🏆 Model Recommendation")
+            
+            rf_score = st.session_state['rf_metrics']['r2_test']
+            lstm_score = st.session_state['lstm_metrics']['r2_test']
+            
+            if rf_score > lstm_score:
+                winner = "Random Forest"
+                winner_color = "#FF6B35"
+                winner_r2 = rf_score
+                winner_rmse = st.session_state['rf_metrics']['rmse_test']
+            else:
+                winner = "LSTM"
+                winner_color = "#004E89"
+                winner_r2 = lstm_score
+                winner_rmse = st.session_state['lstm_metrics']['rmse_test']
+            
+            st.markdown(f"""
+            <div style='background-color: {winner_color}; padding: 20px; border-radius: 10px; color: white;'>
+                <h3 style='color: white; margin: 0;'>🏆 Best Performing Model: {winner}</h3>
+                <p style='margin: 10px 0 0 0; font-size: 1.1em;'>
+                    <strong>R² Score:</strong> {winner_r2:.4f} | <strong>RMSE:</strong> {winner_rmse:.2f} W
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("""
+            #### 💡 Model Selection Guidelines:
+            - **Random Forest**: Better for interpretability, faster training, good for tabular data
+            - **LSTM**: Better for temporal patterns, sequential dependencies, time-series forecasting
+            - **Recommendation**: Use the model with higher R² and lower RMSE for your specific use case
+            """)
 
 # Footer
 st.markdown("---")
-st.markdown("<div style='text-align:center;color:#666'>🌟 Solar Energy XAI — Random Forest & LSTM</div>", unsafe_allow_html=True)
+st.markdown("""
+<div style='text-align:center;color:#666; padding: 20px;'>
+    <p style='font-size: 1.1em;'>🌟 <strong>Solar Energy XAI Dashboard</strong></p>
+    <p>Explainable AI with Random Forest & LSTM | Powered by SHAP</p>
+    <p style='font-size: 0.9em; color: #999;'>
+        🌲 Random Forest for Feature Importance | 🧠 LSTM for Time Series | 🔍 SHAP for Explainability
+    </p>
+</div>
+""", unsafe_allow_html=True)
