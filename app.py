@@ -1,9 +1,9 @@
-# app.py — Solar Energy XAI (RF + LSTM) with robust SHAP fallback and Arrow-safe DataFrame display
+# app.py — Solar Energy XAI (RF + LSTM) with lazy SHAP import and robust fallbacks
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # headless backend
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
@@ -15,14 +15,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
-# Optional: SHAP
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except Exception:
-    SHAP_AVAILABLE = False
-
-# Optional: TensorFlow / Keras for LSTM
+# TensorFlow (optional for LSTM)
 try:
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
@@ -32,50 +25,41 @@ try:
 except Exception:
     TF_AVAILABLE = False
 
+# NOTE: do NOT import shap at module load time. We'll import lazily when user requests SHAP.
+SHAP_AVAILABLE = None  # None = unknown; True/False after dynamic import attempt
+
 # --------------------
 # Helpers
 # --------------------
 def make_arrow_safe(df_in):
-    """
-    Convert DataFrame columns to types that pyarrow/Streamlit can serialize:
-      - datelike -> datetime64[ns]
-      - numeric-like -> numeric (coerce)
-      - everything else -> string
-    Returns a copy.
-    """
+    """Make DataFrame safe for pyarrow/Streamlit: convert datelike -> datetime, numeric-like -> numeric, else -> str"""
     if df_in is None:
         return df_in
     df = df_in.copy()
     for col in df.columns:
         try:
             series = df[col]
-            # already datetime?
             if pd.api.types.is_datetime64_any_dtype(series):
-                df[col] = pd.to_datetime(series, errors='coerce')
+                df[col] = pd.to_datetime(series, errors="coerce")
                 continue
 
-            # object columns that look like timestamps?
             if series.dtype == object:
                 sample = series.dropna().astype(str).head(20)
                 if not sample.empty and all(any(ch in s for ch in [":", "-", "T"]) for s in sample):
-                    parsed = pd.to_datetime(series, errors='coerce')
-                    non_null_ratio = parsed.notna().sum() / max(1, len(parsed))
-                    if non_null_ratio > 0.5:
+                    parsed = pd.to_datetime(series, errors="coerce")
+                    if parsed.notna().sum() / max(1, len(parsed)) > 0.5:
                         df[col] = parsed
                         continue
 
-            # numeric?
             if pd.api.types.is_numeric_dtype(series):
-                df[col] = pd.to_numeric(series, errors='coerce')
+                df[col] = pd.to_numeric(series, errors="coerce")
                 continue
 
-            # coerce strings that are numeric-like
-            coerced_num = pd.to_numeric(series, errors='coerce')
+            coerced_num = pd.to_numeric(series, errors="coerce")
             if coerced_num.notna().sum() > len(series) * 0.5:
                 df[col] = coerced_num
                 continue
 
-            # else stringify
             df[col] = series.astype(str)
         except Exception:
             df[col] = df[col].astype(str)
@@ -85,7 +69,7 @@ def make_arrow_safe(df_in):
 def generate_sample_data(n_samples=1200, seed=42):
     np.random.seed(seed)
     dates = pd.date_range(start="2023-01-01", periods=n_samples, freq="15min")
-    hours = dates.hour + dates.minute/60
+    hours = dates.hour + dates.minute / 60
     days = np.arange(n_samples) / 96
     daily_pattern = np.sin((hours - 6) * np.pi / 12)
     seasonal_variation = 1 + 0.3 * np.sin(days * 2 * np.pi / 365)
@@ -389,6 +373,7 @@ with tab2:
                             c4.metric("MAPE (test)", f"{mape_test:.2f}%")
 
                     except Exception as e:
+                        # note: if shap was imported earlier this error could appear; lazy import avoids that
                         st.error(f"LSTM training failed: {e}")
 
             if st.session_state.get('lstm_trained', False):
@@ -410,134 +395,168 @@ with tab2:
 # ---------- Tab 3: XAI ----------
 with tab3:
     st.subheader("🔍 Explainable AI (SHAP)")
-    if not SHAP_AVAILABLE:
-        st.error("SHAP not installed. `pip install shap` to enable.")
-    else:
-        col_rf, col_lstm = st.columns(2)
 
-        # RF SHAP
-        with col_rf:
-            st.markdown("### 🌲 SHAP for Random Forest")
-            if not st.session_state.get('rf_trained', False):
-                st.warning("Train RF first")
-            else:
-                if st.button("🔬 Compute SHAP (RF)", use_container_width=True):
-                    with st.spinner("Computing SHAP for RF..."):
-                        try:
-                            rf = st.session_state['rf_model']
-                            X_test_s = st.session_state['rf_X_test_s']
-                            expl = shap.TreeExplainer(rf)
-                            shap_values = expl.shap_values(X_test_s)
-                            st.session_state['rf_shap_values'] = shap_values
-                            st.success("SHAP computed for RF")
+    col_rf, col_lstm = st.columns(2)
 
-                            fig = plt.figure(figsize=(10,6))
-                            shap.summary_plot(shap_values, X_test_s, feature_names=FEATURES, show=False)
-                            st.pyplot(fig)
-                            plt.close(fig)
+    # ---------- RF SHAP (lazy import) ----------
+    with col_rf:
+        st.markdown("### 🌲 SHAP for Random Forest")
+        if not st.session_state.get('rf_trained', False):
+            st.warning("Train RF first")
+        else:
+            if st.button("🔬 Compute SHAP (RF)", use_container_width=True):
+                with st.spinner("Computing SHAP for RF..."):
+                    try:
+                        # lazy import shap
+                        global SHAP_AVAILABLE
+                        if SHAP_AVAILABLE is None:
+                            try:
+                                import shap as _shap
+                                SHAP_AVAILABLE = True
+                                shap = _shap
+                            except Exception as e:
+                                SHAP_AVAILABLE = False
+                                st.error(f"Could not import shap: {e}")
+                                raise e
+                        else:
+                            # if previously imported, import into local name
+                            if SHAP_AVAILABLE:
+                                import importlib
+                                shap = importlib.import_module("shap")
 
-                            avg_imp = np.mean(np.abs(shap_values), axis=0)
-                            imp_df = pd.DataFrame({'feature': FEATURES, 'importance': avg_imp}).sort_values('importance', ascending=True)
-                            fig2, ax2 = plt.subplots(figsize=(8,6))
-                            ax2.barh(imp_df['feature'], imp_df['importance'])
-                            ax2.set_title("RF SHAP mean(|value|)")
-                            st.pyplot(fig2)
-                            plt.close(fig2)
+                        rf = st.session_state['rf_model']
+                        X_test_s = st.session_state['rf_X_test_s']
+                        expl = shap.TreeExplainer(rf)
+                        shap_values = expl.shap_values(X_test_s)
+                        st.session_state['rf_shap_values'] = shap_values
+                        st.success("✅ SHAP computed for RF")
 
-                        except Exception as e:
-                            st.error(f"SHAP RF error: {e}")
+                        # Summary plot
+                        fig = plt.figure(figsize=(10,6))
+                        shap.summary_plot(shap_values, X_test_s, feature_names=FEATURES, show=False)
+                        st.pyplot(fig)
+                        plt.close(fig)
 
-        # LSTM SHAP (robust)
-        with col_lstm:
-            st.markdown("### 🧠 SHAP for LSTM (Deep -> Gradient -> Permutation fallback)")
-            if not st.session_state.get('lstm_trained', False):
-                st.warning("Train LSTM first")
-            elif not TF_AVAILABLE:
-                st.error("TensorFlow not available")
-            else:
-                if st.button("🔬 Compute SHAP (LSTM)", use_container_width=True):
-                    with st.spinner("Computing SHAP values for LSTM (attempting Deep -> Gradient -> Permutation)..."):
-                        try:
-                            model = st.session_state['lstm_model']
-                            X_test_seq = st.session_state.get('lstm_X_test_seq', None)
-                            feat_names = FEATURES
+                        # Importance bar
+                        avg_imp = np.mean(np.abs(shap_values), axis=0)
+                        imp_df = pd.DataFrame({'feature': FEATURES, 'importance': avg_imp}).sort_values('importance', ascending=True)
+                        fig2, ax2 = plt.subplots(figsize=(8,6))
+                        ax2.barh(imp_df['feature'], imp_df['importance'])
+                        ax2.set_title("RF SHAP mean(|value|)")
+                        st.pyplot(fig2)
+                        plt.close(fig2)
 
-                            if X_test_seq is None or len(X_test_seq) == 0:
-                                st.error("No test sequences found for LSTM.")
+                    except Exception as e:
+                        st.error(f"SHAP RF error: {e}")
+
+    # ---------- LSTM SHAP (lazy import + robust) ----------
+    with col_lstm:
+        st.markdown("### 🧠 SHAP for LSTM (Deep -> Gradient -> Permutation fallback)")
+        if not st.session_state.get('lstm_trained', False):
+            st.warning("Train LSTM first")
+        elif not TF_AVAILABLE:
+            st.error("TensorFlow not available")
+        else:
+            if st.button("🔬 Compute SHAP (LSTM)", use_container_width=True):
+                with st.spinner("Computing SHAP values for LSTM (attempting Deep->Gradient->Permutation)..."):
+                    try:
+                        # lazy import shap
+                        global SHAP_AVAILABLE
+                        shap = None
+                        if SHAP_AVAILABLE is None:
+                            try:
+                                import shap as _shap
+                                SHAP_AVAILABLE = True
+                                shap = _shap
+                            except Exception as e:
+                                SHAP_AVAILABLE = False
+                                shap = None
+                                st.warning(f"Could not import shap: {e}. Will try permutation fallback.")
+                        else:
+                            if SHAP_AVAILABLE:
+                                import importlib
+                                shap = importlib.import_module("shap")
+
+                        model = st.session_state['lstm_model']
+                        X_test_seq = st.session_state.get('lstm_X_test_seq', None)
+                        feat_names = FEATURES
+
+                        if X_test_seq is None or len(X_test_seq) == 0:
+                            st.error("No LSTM test sequences found. Retrain with more data or shorter seq length.")
+                        else:
+                            sample = X_test_seq[:min(200, len(X_test_seq))]
+                            background = X_test_seq[:min(50, len(X_test_seq))]
+
+                            arr = None
+                            expl_used = None
+
+                            # Attempt DeepExplainer
+                            if shap is not None:
+                                try:
+                                    expl = shap.DeepExplainer(model, background)
+                                    shap_values = expl.shap_values(sample)
+                                    arr = np.array(shap_values[0]) if isinstance(shap_values, list) else np.array(shap_values)
+                                    expl_used = "DeepExplainer"
+                                except Exception as e_deep:
+                                    st.warning(f"DeepExplainer failed: {e_deep!s}. Trying GradientExplainer...")
+
+                            # Attempt GradientExplainer
+                            if arr is None and shap is not None:
+                                try:
+                                    expl = shap.GradientExplainer(model, background)
+                                    shap_values = expl.shap_values(sample)
+                                    arr = np.array(shap_values[0]) if isinstance(shap_values, list) else np.array(shap_values)
+                                    expl_used = "GradientExplainer"
+                                except Exception as e_grad:
+                                    st.warning(f"GradientExplainer failed: {e_grad!s}. Falling back to permutation importance.")
+
+                            # Permutation fallback
+                            if arr is None:
+                                st.info("Permutation fallback: estimating importance by shuffling features (model-agnostic). This may be slow.")
+                                try:
+                                    preds_base = model.predict(sample, verbose=0).flatten()
+                                    n_samples, seq_len, n_feat = sample.shape
+                                    mean_imp = np.zeros(n_feat)
+                                    for fi in range(n_feat):
+                                        sample_perm = sample.copy()
+                                        # shuffle feature fi across samples for each timestep
+                                        for t in range(seq_len):
+                                            np.random.shuffle(sample_perm[:, t, fi])
+                                        preds_perm = model.predict(sample_perm, verbose=0).flatten()
+                                        mean_imp[fi] = np.mean(np.abs(preds_base - preds_perm))
+                                    arr = np.zeros((n_samples, seq_len, n_feat))
+                                    for fi in range(n_feat):
+                                        arr[:, :, fi] = mean_imp[fi]
+                                    expl_used = "PermutationFallback"
+                                except Exception as e_perm:
+                                    st.error(f"Permutation fallback failed: {e_perm!s}")
+                                    arr = None
+
+                            # Visualize if arr available
+                            if arr is not None:
+                                st.success(f"SHAP-like importances computed (method={expl_used})")
+                                abs_arr = np.abs(arr)
+                                mean_over_samples = np.mean(abs_arr, axis=0)  # (seq_len, n_features)
+                                mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (n_features,)
+
+                                imp_df = pd.DataFrame({'feature': feat_names, 'importance': mean_feat_imp}).sort_values('importance', ascending=True)
+                                fig1, ax1 = plt.subplots(figsize=(8,6))
+                                ax1.barh(imp_df['feature'], imp_df['importance'])
+                                ax1.set_title(f"LSTM feature importance (method={expl_used})")
+                                st.pyplot(fig1)
+                                plt.close(fig1)
+
+                                fig2, ax2 = plt.subplots(figsize=(10,6))
+                                sns.heatmap(mean_over_samples.T, cmap='viridis', yticklabels=feat_names, xticklabels=False, ax=ax2)
+                                ax2.set_xlabel("Timestep")
+                                ax2.set_ylabel("Feature")
+                                ax2.set_title("Importance per Timestep × Feature")
+                                st.pyplot(fig2)
+                                plt.close(fig2)
                             else:
-                                sample = X_test_seq[:min(200, len(X_test_seq))]
-                                background = X_test_seq[:min(50, len(X_test_seq))]
-
-                                arr = None
-                                expl_used = None
-
-                                # Attempt DeepExplainer
-                                if SHAP_AVAILABLE:
-                                    try:
-                                        expl = shap.DeepExplainer(model, background)
-                                        shap_values = expl.shap_values(sample)
-                                        arr = np.array(shap_values[0]) if isinstance(shap_values, list) else np.array(shap_values)
-                                        expl_used = "DeepExplainer"
-                                    except Exception as e_deep:
-                                        st.warning(f"DeepExplainer failed: {e_deep!s}. Trying GradientExplainer...")
-
-                                # Attempt GradientExplainer
-                                if arr is None and SHAP_AVAILABLE:
-                                    try:
-                                        expl = shap.GradientExplainer(model, background)
-                                        shap_values = expl.shap_values(sample)
-                                        arr = np.array(shap_values[0]) if isinstance(shap_values, list) else np.array(shap_values)
-                                        expl_used = "GradientExplainer"
-                                    except Exception as e_grad:
-                                        st.warning(f"GradientExplainer failed: {e_grad!s}. Falling back to permutation.")
-
-                                # Permutation fallback
-                                if arr is None:
-                                    st.info("Falling back to permutation importance (model-agnostic). This can be slow.")
-                                    try:
-                                        preds_base = model.predict(sample, verbose=0).flatten()
-                                        n_samples, seq_len, n_feat = sample.shape
-                                        mean_imp = np.zeros(n_feat)
-                                        for fi in range(n_feat):
-                                            sample_perm = sample.copy()
-                                            for t in range(seq_len):
-                                                np.random.shuffle(sample_perm[:, t, fi])
-                                            preds_perm = model.predict(sample_perm, verbose=0).flatten()
-                                            mean_imp[fi] = np.mean(np.abs(preds_base - preds_perm))
-                                        # build arr shaped (n_samples, seq_len, n_feat) repeating per-feature importance
-                                        arr = np.zeros((n_samples, seq_len, n_feat))
-                                        for fi in range(n_feat):
-                                            arr[:, :, fi] = mean_imp[fi]
-                                        expl_used = "PermutationFallback"
-                                    except Exception as e_perm:
-                                        st.error(f"Permutation fallback failed: {e_perm!s}")
-                                        arr = None
-
-                                # If we have arr, visualize summary
-                                if arr is not None:
-                                    st.success(f"Computed SHAP-like importances (method={expl_used})")
-                                    abs_arr = np.abs(arr)
-                                    mean_over_samples = np.mean(abs_arr, axis=0)  # (seq_len, n_features)
-                                    mean_feat_imp = np.mean(mean_over_samples, axis=0)  # (n_features,)
-
-                                    imp_df = pd.DataFrame({'feature': feat_names, 'importance': mean_feat_imp}).sort_values('importance', ascending=True)
-                                    fig1, ax1 = plt.subplots(figsize=(8,6))
-                                    ax1.barh(imp_df['feature'], imp_df['importance'])
-                                    ax1.set_title(f"LSTM feature importance (method={expl_used})")
-                                    st.pyplot(fig1)
-                                    plt.close(fig1)
-
-                                    fig2, ax2 = plt.subplots(figsize=(10,6))
-                                    sns.heatmap(mean_over_samples.T, cmap='viridis', yticklabels=feat_names, xticklabels=False, ax=ax2)
-                                    ax2.set_xlabel("Timestep")
-                                    ax2.set_ylabel("Feature")
-                                    ax2.set_title("Importance per Timestep × Feature")
-                                    st.pyplot(fig2)
-                                    plt.close(fig2)
-                                else:
-                                    st.error("Failed to compute SHAP-like importances for LSTM.")
-                        except Exception as e_all:
-                            st.error(f"Unexpected error during LSTM SHAP: {e_all!s}")
+                                st.error("Failed to compute SHAP-like importances for LSTM.")
+                    except Exception as e_all:
+                        st.error(f"Unexpected error during LSTM SHAP: {e_all!s}")
 
 # ---------- Tab 4: Predictions ----------
 with tab4:
@@ -636,7 +655,6 @@ with tab5:
                     st.write(f"- MAPE (test): **{m['mape_test']:.2f}%**")
                 else:
                     st.write("No RF metrics stored.")
-                # RF feature importance
                 rf_model = st.session_state.get('rf_model', None)
                 if rf_model is not None:
                     try:
