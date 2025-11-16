@@ -6,3 +6,4 @@ seaborn
 scikit-learn
 shap
 scipy
+tensorflow-cpu
